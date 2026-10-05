@@ -18,7 +18,7 @@ Development happens in a separate fork:
 - development fork: [crispyduck00/obsidian-nextcloudsync](https://github.com/crispyduck00/obsidian-nextcloudsync)
 - installable plugin: **this repository**
 
-The development fork keeps `main` aligned with upstream. Features and fixes are kept on independent topic branches with Draft PRs; the validated combined build lives on its `fast-nextcloud-sync` integration branch.
+The development fork keeps `main` aligned with upstream. Features and fixes are kept on independent topic branches with Draft PRs; the validated combined build lives on its `integration/all-topics` integration branch.
 
 Only a validated integration state is promoted here. This repository then adds the small standalone layer: its own plugin ID/name, documentation, versioning, and BRAT releases.
 
