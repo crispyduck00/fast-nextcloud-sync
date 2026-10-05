@@ -38,15 +38,11 @@ The important branch classes are:
 - `fixes/<name>` — one bugfix, directly from upstream/main
 - integration branch — validated combination of all selected topic branches
 
-At the time this document was written, the integration branch is named:
-
-`fast-nextcloud-sync`
-
-That name is easy to confuse with the standalone repository below. The preferred future name is:
+The integration branch is:
 
 `integration/all-topics`
 
-Do not rename it casually in the middle of active testing. When it is renamed, update this document and any scripts/references at the same time.
+The old branch name `fast-nextcloud-sync` was retired because it was too easy to confuse with the standalone repository/plugin below. **Fast Nextcloud Sync** now refers only to the installable product/release repository; `integration/all-topics` always refers to the combined development branch.
 
 ### 3. Standalone plugin/release repository
 
@@ -81,7 +77,6 @@ upstream/main
 selected topic branches
         │
         └──── merge commits ────> integration/all-topics
-                                  (currently fast-nextcloud-sync)
 ```
 
 Rules:
@@ -320,7 +315,7 @@ Use these terms consistently:
 : one isolated `features/*` or `fixes/*` branch based directly on upstream/main
 
 **Integration branch**
-: combined selected topics in the development fork; currently named `fast-nextcloud-sync`, preferred future name `integration/all-topics`
+: combined selected topics in the development fork; named `integration/all-topics`
 
 **Standalone repository**
 : `crispyduck00/fast-nextcloud-sync`
@@ -328,7 +323,7 @@ Use these terms consistently:
 **Fast Nextcloud Sync plugin**
 : installable Obsidian plugin with ID `fast-nextcloud-sync`
 
-These distinctions matter. In particular, the development integration branch and the standalone repository are not the same thing even if the old branch name is identical to the repository/plugin name.
+These distinctions matter. The old duplicate name was intentionally removed: `integration/all-topics` is the development composition branch, while `fast-nextcloud-sync` is the standalone repository/plugin identity.
 
 ## Checklist before continuing work in a new session
 
