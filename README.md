@@ -8,6 +8,8 @@ This fork grew from a personal goal: make synchronization feel faster and requir
 
 > **Status:** primarily built for personal/family use and experimentation. Others are welcome to use it, test it, report problems, contribute, or continue maintaining it, but there is **no guarantee of long-term maintenance, support, compatibility, or release cadence**.
 
+> Contributors and future development sessions: see [DEVELOPMENT.md](DEVELOPMENT.md) for the branch, integration, promotion, and release workflow.
+
 ## Relationship to upstream
 
 Development happens in a separate fork:
