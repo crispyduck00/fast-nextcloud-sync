@@ -1,0 +1,884 @@
+import { RequestUrlParam, RequestUrlResponse } from 'obsidian';
+import { requestUrlWithTimeout } from './requestWithTimeout';
+import {
+  NextcloudFeatures,
+  RemoteFileInfo,
+  RemoteDirInfo,
+  SyncChanges,
+  FileVersion,
+  NetworkError,
+  SyncTokenExpiredError,
+  ConflictError,
+  FeatureUnsupportedError,
+  FileLockedError,
+  MaintenanceModeError,
+  PreconditionFailedError,
+  RemoteRootMissingError,
+  RemoteDirCreateError,
+  VaultRootOutcome,
+  ServerLockedError,
+} from '../types';
+import { IWebDAVClient, type RemoteRootInfo } from './IWebDAVClient';
+import { DavSyncSettings } from '../types';
+import { toRemotePath, hrefToRelative, encodeRemoteUrl, encodeServerUrl, ensureRemoteDir, mkcolStrict, prepareMissingParentRetry, isTransportFailure } from './remotePath';
+import { RemoteDirCache } from './RemoteDirCache';
+import { sha256 } from '../util/hash';
+import { PARSE_YIELD_EVERY } from '../util/limits';
+import { NO_CACHE_HEADERS } from './noCacheHeaders';
+import {
+  readMultistatus, readSyncToken, readHref, readProp, readStatusText,
+  readIsCollection, readDavProps, readOwncloudProps, readLockDiscoveryOwner,
+} from './dav/propfind';
+import { withRetry } from '../util/retry';
+
+const PROPFIND_BODY = `<?xml version="1.0" encoding="utf-8" ?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop>
+    <d:getetag/>
+    <d:getcontentlength/>
+    <d:getlastmodified/>
+    <d:resourcetype/>
+    <d:sync-token/>
+    <oc:checksums/>
+    <oc:fileid/>
+  </d:prop>
+</d:propfind>`;
+
+/** Depth:0 PROPFIND for `D:lockdiscovery` only, sent once after a 423 (feature 090, contracts/lockdiscovery-propfind.md). */
+const LOCKDISCOVERY_BODY = `<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>`;
+
+const REPORT_BODY = (syncToken: string) => `<?xml version="1.0" encoding="utf-8" ?>
+<d:sync-collection xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:sync-token>${syncToken}</d:sync-token>
+  <d:sync-level>infinite</d:sync-level>
+  <d:prop>
+    <d:getetag/>
+    <d:getcontentlength/>
+    <d:getlastmodified/>
+    <d:resourcetype/>
+    <oc:checksums/>
+    <oc:fileid/>
+  </d:prop>
+</d:sync-collection>`;
+
+export class NextcloudClient implements IWebDAVClient {
+  private features: NextcloudFeatures | null = null;
+  /** Remote directories already created via MKCOL (in-session cache). */
+  private readonly createdDirs = new RemoteDirCache();
+
+  constructor(
+    private readonly settings: DavSyncSettings,
+    private readonly appPassword: string,
+    /** Base folder for the remote sync target (usually the Vault name). Empty string means directly under the files root. */
+    private readonly remoteBase: string = '',
+    /** Optional diagnostic sink (wired to the Debug-mode file log) for network-level troubleshooting. */
+    private readonly diag?: (msg: string) => void,
+  ) {}
+
+  private get baseUrl(): string {
+    // encodeServerUrl: the configured Server URL may end in a subfolder containing a space or
+    // non-ASCII characters, and it is the base of every request URL (see remotePath.ts).
+    return encodeServerUrl(this.settings.serverUrl.replace(/\/$/, ''));
+  }
+
+  /** The server's base URL, derived by stripping `/remote.php/...` and everything after it from the WebDAV endpoint URL. */
+  private serverBaseUrl(): string {
+    return encodeServerUrl(this.settings.serverUrl.replace(/\/remote\.php.*$/, '').replace(/\/$/, ''));
+  }
+
+  /** Returns the base URL for non-files DAV namespaces such as versions / uploads. */
+  private davBase(namespace: 'versions' | 'uploads'): string {
+    return `${this.serverBaseUrl()}/remote.php/dav/${namespace}/${encodeURIComponent(this.settings.username)}`;
+  }
+
+  /** Converts a Vault-relative path into a WebDAV URL under the base folder. */
+  private remoteUrl(rel: string): string {
+    return encodeRemoteUrl(this.baseUrl, toRemotePath(this.remoteBase, rel));
+  }
+
+  private get authHeader(): string {
+    const credentials = `${this.settings.username}:${this.appPassword}`;
+    const bytes = new TextEncoder().encode(credentials);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return `Basic ${btoa(binary)}`;
+  }
+
+  /** Configured WebDAV request timeout in ms (0 = unbounded). Read live so a settings change applies next request. */
+  private get timeoutMs(): number {
+    return (this.settings.networkTimeoutSeconds ?? 0) * 1000;
+  }
+
+  /** All WebDAV requests route through here so the configured Network timeout is always applied. */
+  private req(params: RequestUrlParam): Promise<RequestUrlResponse> {
+    return requestUrlWithTimeout(params, this.timeoutMs);
+  }
+
+  /** Read-only requests (PROPFIND/GET) retry up to 2x on a transient req() rejection (timeout, connection
+   *  failure). req() only rejects when no HTTP response was received at all — any status code (incl.
+   *  401/404/415) resolves normally and is handled by the caller, so every rejection reaching here is
+   *  transient by construction; no error-type check is needed. Logs a single debug line per retry via
+   *  the existing diag sink so a captured debug log shows when this kicked in. Write requests (PUT/
+   *  DELETE/MOVE/MKCOL/PATCH/LOCK/UNLOCK) and the REPORT-based sync-token/getChanges calls stay on the
+   *  plain req() (never retried here) — see the T004/T006 task notes for the rationale.
+   */
+  private reqReadonly(params: RequestUrlParam): Promise<RequestUrlResponse> {
+    return withRetry(() => this.req(params), 2, 1000, (err) => {
+      this.diag?.(`reqReadonly retry: ${params.method ?? 'GET'} ${params.url} (${err instanceof Error ? err.message : String(err)})`);
+      return true;
+    });
+  }
+
+  async connect(): Promise<NextcloudFeatures> {
+    // Check /status.php for maintenance mode
+    const statusUrl = this.settings.serverUrl.replace(/\/remote\.php.*$/, '') + '/status.php';
+    const statusRes = await this.reqReadonly({ url: statusUrl, method: 'GET', headers: { ...NO_CACHE_HEADERS }, throw: false });
+    // `productname` is the second witness for detection below. It is read here because /status.php is
+    // already being parsed for maintenance, and because it needs no authentication — which is exactly
+    // what makes it useful when a genuine Nextcloud has its OCS endpoint closed off (feature 073, D-2).
+    let statusProductName = '';
+    if (statusRes.status === 200) {
+      const status = statusRes.json as Record<string, unknown>;
+      if (status.maintenance === true) {
+        throw new MaintenanceModeError();
+      }
+      statusProductName = typeof status.productname === 'string' ? status.productname : '';
+    }
+
+    // Get capabilities
+    const capUrl = this.settings.serverUrl.replace(/\/remote\.php.*$/, '') + '/ocs/v1.php/cloud/capabilities?format=json';
+    const capRes = await this.reqReadonly({
+      url: capUrl,
+      method: 'GET',
+      headers: { Authorization: this.authHeader, 'OCS-APIRequest': 'true', ...NO_CACHE_HEADERS },
+      throw: false,
+    });
+
+    let version = '';
+    let hasChecksums = false;
+    let hasFilesLocking = false;
+    let hasBulkUpload = false;
+    /** Whether OCS actually yielded capabilities — the primary detection witness (feature 073). */
+    let ocsAnswered = false;
+
+    if (capRes.status === 200) {
+      const cap = capRes.json as Record<string, unknown>;
+      const data = (cap as Record<string, Record<string, unknown>>).ocs?.data as Record<string, unknown> | undefined;
+      ocsAnswered = data != null;
+      version = (data?.version as Record<string, string>)?.string ?? '';
+      const caps = data?.capabilities as Record<string, unknown> | undefined;
+      const checksums = caps?.checksums as Record<string, unknown> | undefined;
+      hasChecksums = Array.isArray(checksums?.supportedTypes) && (checksums.supportedTypes as string[]).length > 0;
+      // When the files_lock app is enabled, capabilities.files.locking contains a version string.
+      const files = caps?.files as Record<string, unknown> | undefined;
+      hasFilesLocking = files?.locking != null && files.locking !== false;
+      // The bulk-upload endpoint is advertised under capabilities.dav.bulkupload (a version string)
+      // on servers that support it. Absent ⇒ fall back to per-file PUT (feature-gated by the engine).
+      const dav = caps?.dav as Record<string, unknown> | undefined;
+      hasBulkUpload = dav?.bulkupload != null && dav.bulkupload !== false;
+    }
+
+    // Get current sync-token
+    const syncToken = await this.getSyncToken();
+
+    // Detection is taken from what the probes ANSWERED, never from this class being the one asking
+    // (feature 073, GitHub-adjacent report). Capabilities is the primary witness because every other
+    // flag above is derived from it: a connection that cannot read it has nothing to back an
+    // `isNextcloud: true` with, and the engine would then gate Nextcloud-only work on a value with no
+    // substance behind it. /status.php is the second witness so a genuine Nextcloud whose OCS is
+    // closed off (401/403) is not misfiled as plain WebDAV. Neither witness answering means the
+    // caller should be using StandardWebDAVClient instead — WebDAVFactory acts on that.
+    const isNextcloud = ocsAnswered || /nextcloud/i.test(statusProductName);
+
+    this.features = {
+      isNextcloud,
+      version,
+      hasChecksums,
+      hasFilesLocking,
+      hasBulkUpload,
+      syncToken,
+    };
+    return this.features;
+  }
+
+  async getFiles(path: string): Promise<RemoteFileInfo[]> {
+    const res = await this.reqReadonly({
+      url: this.remoteUrl(path),
+      method: 'PROPFIND',
+      headers: {
+        Authorization: this.authHeader,
+        Depth: 'infinity',
+        'Content-Type': 'application/xml; charset=utf-8',
+        ...NO_CACHE_HEADERS,
+      },
+      body: PROPFIND_BODY,
+      throw: false,
+    });
+    // A 404 on the vault folder itself is NOT an empty listing (feature 083 / issue #50). Collapsing
+    // the two hid a whole missing vault behind "the server has no files", which the full scan then
+    // read as "everything was deleted remotely". They are different facts and the engine acts on them
+    // differently: an empty listing drives absence-based deletion, a missing folder drives a re-seed.
+    // Subpaths keep the old meaning — nothing depends on telling an absent subfolder from an empty one.
+    if (res.status === 404) {
+      if (path === '') throw new RemoteRootMissingError();
+      return [];
+    }
+    if (res.status !== 207) throw new NetworkError(res.status, res.text, 'PROPFIND');
+    return await this.parsePropfindResponse(res.text, { op: 'getFiles', path, status: res.status, method: 'PROPFIND' });
+  }
+
+  /**
+   * Feature 064 (C-0): remote state of ONE file via a Depth:0 PROPFIND, so the watch-mode single-file
+   * path can classify against the real remote instead of uploading blind. The response is parsed by
+   * the SAME {@link parsePropfindResponse} the full scan uses, so every field (checksum/etag/size/
+   * mtime/fileId) carries identical semantics — that is what lets the caller reuse processRemoteFile.
+   * A collection yields no entry there (it is skipped as non-file), hence null. Unlike getFiles, a
+   * non-207 other than 404 THROWS: silently reading an ambiguous failure as "absent" would send the
+   * caller down the create path and blind-overwrite the very file it could not read.
+   */
+  async statFile(remotePath: string): Promise<RemoteFileInfo | null> {
+    const res = await this.reqReadonly({
+      url: this.remoteUrl(remotePath),
+      method: 'PROPFIND',
+      headers: {
+        Authorization: this.authHeader,
+        Depth: '0',
+        'Content-Type': 'application/xml; charset=utf-8',
+        ...NO_CACHE_HEADERS,
+      },
+      body: PROPFIND_BODY,
+      throw: false,
+    });
+    if (res.status === 404) return null; // no such file (or its parent folder does not exist)
+    if (res.status !== 207) throw new NetworkError(res.status, res.text, 'PROPFIND');
+    const entries = await this.parsePropfindResponse(res.text, { op: 'statFile', path: remotePath, status: res.status, method: 'PROPFIND' });
+    return entries[0] ?? null;
+  }
+
+  async getRootInfo(): Promise<RemoteRootInfo> {
+    // Root-ETag short-circuit (spec 023): a single Depth:0 PROPFIND on the vault root. Nextcloud
+    // returns oc:fileid in the same response, which lets Client Push recognise root-folder ETag
+    // propagation without a second request. Never throws: every ambiguous outcome returns nulls so
+    // callers conservatively use the ordinary full reconciliation path.
+    try {
+      const res = await this.reqReadonly({
+        url: this.remoteUrl(''),
+        method: 'PROPFIND',
+        headers: { Authorization: this.authHeader, Depth: '0', 'Content-Type': 'application/xml; charset=utf-8', ...NO_CACHE_HEADERS },
+        body: PROPFIND_BODY,
+        throw: false,
+      });
+      if (res.status !== 207) return { etag: null, fileId: null };
+      const responses = readMultistatus(res.text, { op: 'getRootInfo', path: '', status: res.status, method: 'PROPFIND' });
+      const prop = readProp(responses[0]);
+      if (!prop) return { etag: null, fileId: null };
+
+      const etagRaw = prop.getElementsByTagNameNS('DAV:', 'getetag')[0]?.textContent?.replace(/"/g, '') ?? null;
+      const etag = etagRaw && etagRaw.length > 0 ? etagRaw : null;
+      const rootFileId = readOwncloudProps(prop).fileId?.trim() || null;
+      return { etag, fileId: rootFileId };
+    } catch {
+      return { etag: null, fileId: null };
+    }
+  }
+
+  async getRootEtag(): Promise<string | null> {
+    return (await this.getRootInfo()).etag;
+  }
+
+  async getDirectories(path: string): Promise<RemoteDirInfo[]> {
+    const res = await this.reqReadonly({
+      url: this.remoteUrl(path),
+      method: 'PROPFIND',
+      headers: {
+        Authorization: this.authHeader,
+        Depth: 'infinity',
+        'Content-Type': 'application/xml; charset=utf-8',
+        ...NO_CACHE_HEADERS,
+      },
+      body: PROPFIND_BODY,
+      throw: false,
+    });
+    if (res.status === 404) return [];
+    if (res.status !== 207) throw new NetworkError(res.status, res.text, 'PROPFIND');
+    return await this.parsePropfindDirectories(res.text, { op: 'getDirectories', path, status: res.status, method: 'PROPFIND' });
+  }
+
+  async isRemoteDirEmpty(path: string): Promise<boolean> {
+    // Depth:1 lists the collection itself plus its immediate children. "Empty" (rmdir
+    // semantics) ⇔ the only response is the collection itself. Conservative on any
+    // ambiguity: never report "empty" unless the server clearly says so, so a recursive
+    // DELETE is never issued against a directory that might still hold data. An unreadable body is
+    // exactly that kind of ambiguity (feature 087) — caught below, same as any other failure here.
+    const res = await this.reqReadonly({
+      url: this.remoteUrl(path),
+      method: 'PROPFIND',
+      headers: { Authorization: this.authHeader, Depth: '1', 'Content-Type': 'application/xml; charset=utf-8', ...NO_CACHE_HEADERS },
+      body: PROPFIND_BODY,
+      throw: false,
+    });
+    if (res.status !== 207) return false;
+    let responses: Element[];
+    try {
+      responses = readMultistatus(res.text, { op: 'isRemoteDirEmpty', path, status: res.status, method: 'PROPFIND' });
+    } catch {
+      return false;
+    }
+    let children = 0;
+    for (const resp of responses) {
+      const href = readHref(resp);
+      const rel = hrefToRelative(this.baseUrl, this.remoteBase, href);
+      // rel === '' is the collection itself (or the base); any other entry is a child.
+      if (rel !== null && rel !== '' && rel !== path) children++;
+    }
+    return children === 0;
+  }
+
+  /**
+   * Create `path` (and its ancestors) on the server, FAILING if any level could not be created.
+   *
+   * The failure used to be swallowed: the MKCOL loop ignored its own status codes, so this resolved
+   * whether or not the folder was made. Watch mode records the folder as tracked immediately after
+   * this returns, which meant a folder that was never created could enter the tracking index — and a
+   * tracked folder the server does not have is precisely the shape that drove issue #46's
+   * delete-propagation. A folder that could not be created must say so (feature 088).
+   */
+  async createDirectory(path: string): Promise<void> {
+    // ensureRemoteDir MKCOLs every segment of the path it is given EXCEPT the last (it assumes a
+    // trailing file name), so append a dummy segment to have `path` itself (and its ancestors) created.
+    await ensureRemoteDir(
+      { baseUrl: this.baseUrl, authHeader: this.authHeader, timeoutMs: this.timeoutMs },
+      toRemotePath(this.remoteBase, `${path}/_`),
+      this.createdDirs,
+    );
+  }
+
+  async createVaultRoot(): Promise<VaultRootOutcome> {
+    // A client whose remote base IS the files root has no vault folder to create; answering 'exists'
+    // keeps the caller on its no-destructive-action path rather than inventing a re-seed.
+    if (!this.remoteBase) return 'exists';
+    const ctx = { baseUrl: this.baseUrl, authHeader: this.authHeader, timeoutMs: this.timeoutMs };
+    // Ancestors are best-effort, exactly as the first upload creates them: they are not the question
+    // being asked. Only the vault folder itself is judged strictly, because its 201-vs-405 is the
+    // proof that decides whether the caller may reset tracking and re-seed (contract C-2). Since
+    // feature 088 ensureRemoteDir reports a level it could not create, so the swallow is now explicit
+    // — a transient 423 on an ancestor must not stop mkcolStrict from asking the real question.
+    await ensureRemoteDir(ctx, this.remoteBase, this.createdDirs).catch(() => undefined);
+    const outcome = await mkcolStrict(ctx, this.remoteBase);
+    // A 201 means the vault folder was genuinely absent, which makes every "already created" entry
+    // under it a lie: those directories went away with it. Without this, a folder this client created
+    // earlier in the session is silently skipped when the re-seed tries to put it back — files
+    // survive (a PUT into a missing parent 404s and re-drives MKCOL) but an EMPTY directory has no
+    // write to fail, so it just never reappears. Caught by INV-14 against a live server; no mock can
+    // see it, because the cache is inside the client.
+    if (outcome === 'created') this.createdDirs.clear();
+    return outcome;
+  }
+
+  async deleteCollection(path: string): Promise<void> {
+    const res = await this.req({
+      url: this.remoteUrl(path), method: 'DELETE', headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS }, throw: false,
+    });
+    if (res.status === 404) return; // already gone — the desired end state.
+    if (res.status < 200 || res.status >= 300) throw new NetworkError(res.status, res.text, 'DELETE');
+  }
+
+  async getChanges(syncToken: string): Promise<SyncChanges> {
+    // Run the sync-collection REPORT scoped to the base folder (the Vault folder) only.
+    const res = await this.req({
+      url: this.remoteUrl(''),
+      method: 'REPORT',
+      headers: {
+        Authorization: this.authHeader,
+        'Content-Type': 'application/xml; charset=utf-8',
+        ...NO_CACHE_HEADERS,
+      },
+      body: REPORT_BODY(syncToken),
+      throw: false,
+    });
+    if (res.status === 410) throw new SyncTokenExpiredError();
+    if (res.status !== 207) throw new NetworkError(res.status, res.text, 'REPORT');
+    return await this.parseSyncChanges(res.text, { op: 'getChanges', path: '', status: res.status, method: 'REPORT' });
+  }
+
+  async downloadFile(remotePath: string): Promise<ArrayBuffer> {
+    const res = await this.reqReadonly({ url: this.remoteUrl(remotePath), method: 'GET', headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS }, throw: false });
+    if (res.status !== 200) throw new NetworkError(res.status, '', 'GET');
+    // Return the bytes directly (no shared field) so concurrent downloads cannot race each other.
+    return res.arrayBuffer;
+  }
+
+  /**
+   * A PUT or DELETE just came back 423. Always throws — never resolves — either a
+   * {@link ServerLockedError} naming the lock owner, or the same plain {@link NetworkError} the
+   * caller would have thrown before this feature existed.
+   *
+   * One extra Depth:0 PROPFIND asks the server who holds the lock (feature 090, contract
+   * lockdiscovery-propfind.md). That lookup is best-effort only: any failure of it — a non-207
+   * status, an unreadable body, no owner in it — falls back to the plain NetworkError exactly as
+   * before, because the lookup exists to add information to the original 423, never to replace or
+   * hide it (FR-004).
+   */
+  private async errorFor423(path: string, method: 'PUT' | 'DELETE', originalText: string): Promise<never> {
+    try {
+      const res = await this.reqReadonly({
+        url: this.remoteUrl(path),
+        method: 'PROPFIND',
+        headers: { Authorization: this.authHeader, Depth: '0', 'Content-Type': 'application/xml; charset=utf-8', ...NO_CACHE_HEADERS },
+        body: LOCKDISCOVERY_BODY,
+        throw: false,
+      });
+      if (res.status === 207) {
+        const owner = readLockDiscoveryOwner(res.text);
+        if (owner) throw new ServerLockedError(path, method, owner);
+      }
+    } catch (err) {
+      if (err instanceof ServerLockedError) throw err;
+      // The lookup itself failed (transport error, unreadable body) — fall through to the plain
+      // NetworkError below rather than let this failure mask the original 423.
+    }
+    throw new NetworkError(423, originalText, method);
+  }
+
+  async uploadFile(
+    remotePath: string, data: ArrayBuffer, mtime?: number,
+    opts?: { precomputedSha256?: string; ifMatchEtag?: string | null },
+  ): Promise<void> {
+    // Reactive directory creation (P1-B): try the PUT first and only MKCOL the parents if the server
+    // reports a missing parent (409), then retry once. This drops the per-upload directory probe on
+    // the common path (the directory almost always already exists).
+    const checksum = `SHA256:${opts?.precomputedSha256 ?? await sha256(data)}`;
+    const headers: Record<string, string> = {
+      Authorization: this.authHeader,
+      'OC-Checksum': checksum,
+      ...NO_CACHE_HEADERS,
+    };
+    // X-OC-MTime (Unix seconds) tells Nextcloud to preserve the local file's modification time.
+    if (mtime) headers['X-OC-MTime'] = String(Math.floor(mtime / 1000));
+    // If-Match optimistic concurrency: a remote changed since this etag returns 412.
+    if (opts?.ifMatchEtag) headers['If-Match'] = `"${opts.ifMatchEtag.replace(/^"|"$/g, '')}"`;
+
+    let res = await this.req({ url: this.remoteUrl(remotePath), method: 'PUT', headers, body: data, throw: false });
+    // Missing parent collection → create ancestors, then retry the PUT once. Standard WebDAV
+    // returns 409, but Nextcloud's files DAV returns 404 for a missing parent — handle both
+    // so the first upload into a not-yet-created folder (e.g. a fresh device) succeeds.
+    let dirError: RemoteDirCreateError | null = null;
+    if (res.status === 409 || res.status === 404) {
+      dirError = await prepareMissingParentRetry({ baseUrl: this.baseUrl, authHeader: this.authHeader, timeoutMs: this.timeoutMs }, toRemotePath(this.remoteBase, remotePath), this.createdDirs);
+      if (isTransportFailure(dirError)) throw dirError;
+      res = await this.req({ url: this.remoteUrl(remotePath), method: 'PUT', headers, body: data, throw: false });
+    }
+    if (res.status === 412) throw new PreconditionFailedError(remotePath); // remote changed (If-Match)
+    if (res.status === 423) {
+      // A server-side lock explains the failure on its own; dirError (from a MISSING-parent retry,
+      // an unrelated cause) never applies here. errorFor423 always throws (feature 090).
+      await this.errorFor423(remotePath, 'PUT', res.text);
+    }
+    // A parent we could not create explains the failure far better than the PUT's own status does,
+    // so it wins — but only once the retry has had its chance (feature 088, contract C-4).
+    if (res.status < 200 || res.status >= 300) throw dirError ?? new NetworkError(res.status, res.text, 'PUT');
+  }
+
+  async recalcChecksum(remotePath: string): Promise<string | null> {
+    // Nextcloud's ChecksumUpdatePlugin computes the hash server-side for an existing file
+    // (no download) and persists it, returning it in the OC-Checksum response header.
+    const res = await this.req({
+      url: this.remoteUrl(remotePath),
+      method: 'PATCH',
+      headers: { Authorization: this.authHeader, 'X-Recalculate-Hash': 'sha256', ...NO_CACHE_HEADERS },
+      throw: false,
+    });
+    if (res.status !== 204 && res.status !== 200) return null;
+    const header = res.headers['oc-checksum'] ?? res.headers['OC-Checksum'] ?? '';
+    const m = header.match(/SHA256:([0-9a-fA-F]+)/i);
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  async moveFile(oldPath: string, newPath: string): Promise<void> {
+    // Ensure the destination parent exists before MOVE. This deliberately does NOT drop stale cache
+    // entries: if the folder went away after we created it, the MKCOL here is skipped, the MOVE 404s,
+    // and the recovery below is what puts it back (feature 088, contract C-4).
+    const ctx = { baseUrl: this.baseUrl, authHeader: this.authHeader, timeoutMs: this.timeoutMs };
+    const target = toRemotePath(this.remoteBase, newPath);
+    // A failure here is DISCARDED on purpose. This call is speculative — it runs before the MOVE has
+    // said anything — so it cannot explain a MOVE that fails for some entirely unrelated reason. Only
+    // the recovery below, which the server's own "missing parent" answer triggers, may do that.
+    await ensureRemoteDir(ctx, target, this.createdDirs).catch((err) => {
+      if (!(err instanceof RemoteDirCreateError)) throw err;
+    });
+    const move = () => this.req({
+      url: this.remoteUrl(oldPath),
+      method: 'MOVE',
+      headers: { Authorization: this.authHeader, Destination: this.remoteUrl(newPath), Overwrite: 'F', ...NO_CACHE_HEADERS },
+      throw: false,
+    });
+    let res = await move();
+    let dirError: RemoteDirCreateError | null = null;
+    // Same missing-parent recovery the upload path has always had: a destination folder another
+    // device deleted leaves a stale "already created" entry that makes the MKCOL above a no-op.
+    // Neither client used to do this for MOVE, so a rename into such a folder failed for good.
+    if (res.status === 409 || res.status === 404) {
+      dirError = await prepareMissingParentRetry(ctx, target, this.createdDirs);
+      if (isTransportFailure(dirError)) throw dirError;
+      res = await move();
+    }
+    if (res.status === 412) throw new ConflictError(newPath);
+    if (res.status < 200 || res.status >= 300) throw dirError ?? new NetworkError(res.status, res.text, 'MOVE');
+  }
+
+  async deleteFile(path: string, _expectedRemoteId: string): Promise<void> {
+    const res = await this.req({
+      url: this.remoteUrl(path), method: 'DELETE', headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS }, throw: false,
+    });
+    // Blind delete (P1-B): a 404 means the file is already gone — exactly the desired end state, so
+    // treat it as success rather than an error (no pre-deletion existence probe is needed).
+    if (res.status === 404) return;
+    // A server-side lock explains the failure on its own — errorFor423 always throws (feature 090).
+    if (res.status === 423) await this.errorFor423(path, 'DELETE', res.text);
+    if (res.status < 200 || res.status >= 300) throw new NetworkError(res.status, res.text, 'DELETE');
+  }
+
+  /**
+   * Always null: this client never issues the RFC 6578 sync-collection REPORT.
+   *
+   * Nextcloud's files DAV does not implement it — Sabre answers with ReportNotSupported, i.e.
+   * HTTP 415 — so the request can only ever fail, and the engine already treats "no token" as its
+   * normal path here (full scan, narrowed by the root-ETag short-circuit). Issuing it anyway cost
+   * one guaranteed-415 round-trip per client, and, because Nextcloud logs the rejection at ERROR
+   * level, wrote a stack trace into the administrator's server log every time the plugin loaded
+   * (issue #37). A latch used to suppress the retries after the first 415; not sending the request
+   * at all removes the log noise entirely instead of merely rationing it.
+   *
+   * `getChanges()` is deliberately left in place. It is unreachable while this returns null, but it
+   * is the code that would drive an incremental sync if a token ever did arrive, and deleting it
+   * would throw away the only implementation of that path.
+   */
+  async getSyncToken(): Promise<string | null> {
+    return null;
+  }
+
+  async remoteExists(remotePath: string): Promise<boolean> {
+    // Targeted existence probe (PROPFIND Depth 0). Only a definitive 404 means "gone"; any other
+    // status (incl. transient errors) is treated as "present" so callers never delete on ambiguity.
+    try {
+      const res = await this.reqReadonly({
+        url: this.remoteUrl(remotePath),
+        method: 'PROPFIND',
+        headers: { Authorization: this.authHeader, Depth: '0', ...NO_CACHE_HEADERS },
+        throw: false,
+      });
+      return res.status !== 404;
+    } catch {
+      return true; // conservative: never report "gone" on a failed check
+    }
+  }
+
+  // ── US2: Version history ────────────────────────────────────────────────────
+
+  async listVersions(fileId: string): Promise<FileVersion[]> {
+    if (!fileId) throw new FeatureUnsupportedError('versions');
+    const collectionUrl = `${this.davBase('versions')}/versions/${encodeURIComponent(fileId)}`;
+    const res = await this.reqReadonly({
+      url: collectionUrl,
+      method: 'PROPFIND',
+      headers: {
+        Authorization: this.authHeader,
+        Depth: '1',
+        'Content-Type': 'application/xml; charset=utf-8',
+        ...NO_CACHE_HEADERS,
+      },
+      body: `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns">
+  <d:prop>
+    <d:getlastmodified/>
+    <d:getcontentlength/>
+    <d:getcontenttype/>
+    <d:getetag/>
+    <nc:version-label/>
+    <nc:version-author/>
+    <nc:has-preview/>
+  </d:prop>
+</d:propfind>`,
+      throw: false,
+    });
+    if (res.status === 404) return [];
+    if (res.status !== 207) throw new NetworkError(res.status, res.text, 'PROPFIND');
+    return this.parseVersions(res.text, fileId);
+  }
+
+  async getVersionContent(version: FileVersion, fileId: string): Promise<ArrayBuffer> {
+    if (!fileId) throw new FeatureUnsupportedError('versions');
+    const res = await this.reqReadonly({
+      url: this.versionUrl(version, fileId),
+      method: 'GET',
+      headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS },
+      throw: false,
+    });
+    if (res.status !== 200) throw new NetworkError(res.status, '', 'GET');
+    return res.arrayBuffer;
+  }
+
+  async restoreVersion(version: FileVersion, fileId: string): Promise<void> {
+    if (!fileId) throw new FeatureUnsupportedError('versions');
+    const destination = `${this.davBase('versions')}/restore/target`;
+    const res = await this.req({
+      url: this.versionUrl(version, fileId),
+      method: 'MOVE',
+      headers: { Authorization: this.authHeader, Destination: destination, ...NO_CACHE_HEADERS },
+      throw: false,
+    });
+    if (res.status < 200 || res.status >= 300) throw new NetworkError(res.status, res.text, 'MOVE');
+  }
+
+  /** Builds the URL used for GET/MOVE on a version. */
+  private versionUrl(version: FileVersion, fileId: string): string {
+    return `${this.davBase('versions')}/versions/${encodeURIComponent(fileId)}/${encodeURIComponent(version.versionId)}`;
+  }
+
+  private parseVersions(xml: string, fileId: string): FileVersion[] {
+    const versions: FileVersion[] = [];
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xml, 'text/xml');
+    const responses = doc.getElementsByTagNameNS('DAV:', 'response');
+    for (let i = 0; i < responses.length; i++) {
+      const resp = responses[i];
+      const href = resp.getElementsByTagNameNS('DAV:', 'href')[0]?.textContent ?? '';
+      // Skip a trailing slash (the collection itself).
+      if (href.endsWith('/')) continue;
+      const segments = decodeURIComponent(href).split('/').filter(Boolean);
+      const versionId = segments[segments.length - 1] ?? '';
+      // Exclude the collection itself (the fileId folder) and restore.
+      if (!versionId || versionId === fileId) continue;
+      const prop = resp.getElementsByTagNameNS('DAV:', 'prop')[0];
+      const lastModifiedStr = prop?.getElementsByTagNameNS('DAV:', 'getlastmodified')[0]?.textContent ?? '';
+      const lastModified = lastModifiedStr ? new Date(lastModifiedStr).getTime() : 0;
+      const size = parseInt(prop?.getElementsByTagNameNS('DAV:', 'getcontentlength')[0]?.textContent ?? '0', 10);
+      const mimeType = prop?.getElementsByTagNameNS('DAV:', 'getcontenttype')[0]?.textContent?.trim() ?? '';
+      const etag = prop?.getElementsByTagNameNS('DAV:', 'getetag')[0]?.textContent?.trim() ?? '';
+      const label = prop?.getElementsByTagNameNS('http://nextcloud.org/ns', 'version-label')[0]?.textContent?.trim() ?? '';
+      const authorText = prop?.getElementsByTagNameNS('http://nextcloud.org/ns', 'version-author')[0]?.textContent?.trim() ?? '';
+      const previewText = prop?.getElementsByTagNameNS('http://nextcloud.org/ns', 'has-preview')[0]?.textContent?.trim().toLowerCase() ?? '';
+      versions.push({
+        versionId, href, lastModified, size,
+        label,
+        author: authorText || null,
+        mimeType,
+        etag,
+        hasPreview: previewText === 'true' || previewText === '1',
+      });
+    }
+    // Newest first (descending by lastModified).
+    versions.sort((a, b) => b.lastModified - a.lastModified);
+    return versions;
+  }
+
+  // ── US3: Chunked upload ──────────────────────────────────────────────
+
+  async uploadChunked(
+    remotePath: string, data: ArrayBuffer, chunkSizeBytes: number,
+    opts?: { precomputedSha256?: string; ifMatchEtag?: string | null },
+  ): Promise<void> {
+    const uploadId = `obsidian-${this.settings.deviceId.slice(-8)}-${Date.now()}`;
+    const sessionUrl = `${this.davBase('uploads')}/${uploadId}`;
+    const finalUrl = this.remoteUrl(remotePath);
+    const total = data.byteLength;
+
+    // Compute the SHA-256 once here; reuse it for both the OC-Checksum header and
+    // post-assembly verification so the full buffer is never hashed more than once.
+    const sum = await sha256(data);
+
+    try {
+      // 1. Create the upload session.
+      const mk = await this.req({ url: sessionUrl, method: 'MKCOL', headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS }, throw: false });
+      if (mk.status < 200 || mk.status >= 300) throw new NetworkError(mk.status, mk.text, 'MKCOL');
+
+      // 2. PUT each chunk named by its start byte offset (15-digit zero-padded) so lexical order = assembly order.
+      for (let offset = 0; offset < total; offset += chunkSizeBytes) {
+        const end = Math.min(offset + chunkSizeBytes, total);
+        const chunk = data.slice(offset, end);
+        const chunkName = String(offset).padStart(15, '0');
+        const put = await this.req({
+          url: `${sessionUrl}/${chunkName}`,
+          method: 'PUT',
+          headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS },
+          body: chunk,
+          throw: false,
+        });
+        if (put.status < 200 || put.status >= 300) throw new NetworkError(put.status, put.text, 'PUT');
+      }
+
+      // 3. Ensure the parent directory of the final file exists, then assemble by MOVE-ing .file.
+      // Drop any stale "already created" cache entries first so a folder another device deleted is
+      // genuinely re-created (spec 024) — otherwise the assembling MOVE would target a missing parent.
+      // The failure is kept but not yet acted on: the assembling MOVE fails for plenty of reasons
+      // that have nothing to do with the parent, and only its own answer can tell them apart.
+      const dirError = await prepareMissingParentRetry({ baseUrl: this.baseUrl, authHeader: this.authHeader, timeoutMs: this.timeoutMs }, toRemotePath(this.remoteBase, remotePath), this.createdDirs);
+      const moveHeaders: Record<string, string> = {
+        Authorization: this.authHeader,
+        Destination: finalUrl,
+        'OC-Total-Length': String(total),
+        // Persist the SHA-256 on the assembled file (same rationale as uploadFile).
+        'OC-Checksum': `SHA256:${sum}`,
+        ...NO_CACHE_HEADERS,
+      };
+      // If-Match optimistic concurrency on the assembling MOVE (mirrors uploadFile): a remote
+      // changed since this etag returns 412, mapped below to PreconditionFailedError.
+      if (opts?.ifMatchEtag) moveHeaders['If-Match'] = `"${opts.ifMatchEtag.replace(/^"|"$/g, '')}"`;
+      const move = await this.req({
+        url: `${sessionUrl}/.file`,
+        method: 'MOVE',
+        headers: moveHeaders,
+        throw: false,
+      });
+      if (move.status === 412) throw new PreconditionFailedError(remotePath); // remote changed (If-Match)
+      // The assembling MOVE has no retry of its own (the upload session is single-use), so when the
+      // server says the parent is missing, the level we could not create IS the explanation — say so
+      // instead of "HTTP 404 (MOVE)". Any other failure is reported as itself (feature 088).
+      const parentMissing = move.status === 404 || move.status === 409;
+      if (move.status < 200 || move.status >= 300) {
+        throw (parentMissing && dirError) ? dirError : new NetworkError(move.status, move.text, 'MOVE');
+      }
+
+      // 4. Verify the checksum after assembly (FR-012). Pass the precomputed hash to avoid
+      //    hashing the full buffer a second time.
+      await this.verifyRemoteChecksum(remotePath, data, sum);
+    } catch (err) {
+      // On abort, discard the session so no incomplete file is left at the final path (FR-011).
+      await this.req({ url: sessionUrl, method: 'DELETE', headers: { Authorization: this.authHeader, ...NO_CACHE_HEADERS }, throw: false }).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  /** After upload, fetches the remote checksum and compares it with the local SHA-256.
+   *  Skips verification if unavailable. Accepts an optional precomputed hash to avoid
+   *  redundant hashing of the same buffer (used by uploadChunked). */
+  private async verifyRemoteChecksum(remotePath: string, data: ArrayBuffer, precomputed?: string): Promise<void> {
+    const res = await this.reqReadonly({
+      url: this.remoteUrl(remotePath),
+      method: 'PROPFIND',
+      headers: { Authorization: this.authHeader, Depth: '0', 'Content-Type': 'application/xml; charset=utf-8', ...NO_CACHE_HEADERS },
+      body: `<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:checksums/></d:prop></d:propfind>`,
+      throw: false,
+    });
+    if (res.status !== 207) return;
+    const m = res.text.match(/SHA256:([0-9a-fA-F]+)/i);
+    if (!m) return;
+    const remoteHash = m[1].toLowerCase();
+    const localHash = precomputed ?? await sha256(data);
+    if (remoteHash !== localHash) {
+      throw new NetworkError(0, `Checksum mismatch after chunked upload: ${remotePath}`);
+    }
+  }
+
+  // ── US4: Files Locking ─────────────────────────────────────────────────────
+
+  async lockFile(remotePath: string): Promise<string> {
+    const res = await this.req({
+      url: this.remoteUrl(remotePath),
+      method: 'LOCK',
+      headers: { Authorization: this.authHeader, 'X-User-Lock': '1', ...NO_CACHE_HEADERS },
+      throw: false,
+    });
+    if (res.status === 423) throw new FileLockedError(remotePath);
+    if (res.status < 200 || res.status >= 300) throw new NetworkError(res.status, res.text, 'LOCK');
+    // Nextcloud's files_lock app returns the token in the XML body (<nc:lock-token>files_lock/…),
+    // NOT in a Lock-Token response header. Parse the body first; fall back to headers for
+    // RFC-4918 servers that do use the header. Without this the token is '' and UNLOCK cannot
+    // release the lock (it would leak until the next sync's recovery).
+    let token = '';
+    try {
+      const doc = new DOMParser().parseFromString(res.text, 'text/xml');
+      token = doc.getElementsByTagNameNS('http://nextcloud.org/ns', 'lock-token')[0]?.textContent?.trim() ?? '';
+    } catch {
+      token = '';
+    }
+    if (!token) token = res.headers['lock-token'] ?? res.headers['oc-lock-token'] ?? '';
+    return token;
+  }
+
+  async unlockFile(remotePath: string, token: string): Promise<void> {
+    try {
+      await this.req({
+        url: this.remoteUrl(remotePath),
+        method: 'UNLOCK',
+        headers: { Authorization: this.authHeader, 'Lock-Token': token, 'X-User-Lock': '1', ...NO_CACHE_HEADERS },
+        throw: false,
+      });
+    } catch {
+      // Best-effort. A leftover lock is recovered on the next sync (FR-016).
+    }
+  }
+
+  private async parsePropfindResponse(
+    xml: string, ctx: { op: string; path: string; status: number; method: 'PROPFIND' | 'REPORT' },
+  ): Promise<RemoteFileInfo[]> {
+    const results: RemoteFileInfo[] = [];
+    const responses = readMultistatus(xml, ctx);
+    for (let i = 0; i < responses.length; i++) {
+      // Yield to the event loop periodically so parsing a large Depth:infinity listing does not
+      // freeze the UI / trigger an Android ANR (FR-027 / P2-B).
+      if (i > 0 && i % PARSE_YIELD_EVERY === 0) await new Promise((r) => window.setTimeout(r, 0));
+      const resp = responses[i];
+      const prop = readProp(resp);
+      if (!prop) continue;
+      if (readIsCollection(prop)) continue; // files only; parsePropfindDirectories keeps the inverse
+
+      const path = hrefToRelative(this.baseUrl, this.remoteBase, readHref(resp));
+      if (path === null || path === '') continue; // Skip entries outside the base folder or the folder itself
+      const { etag, size, lastModified } = readDavProps(prop);
+      const { checksum, fileId } = readOwncloudProps(prop);
+      results.push({ path, fileId, checksum, etag, size, lastModified });
+    }
+    return results;
+  }
+
+  private async parsePropfindDirectories(
+    xml: string, ctx: { op: string; path: string; status: number; method: 'PROPFIND' | 'REPORT' },
+  ): Promise<RemoteDirInfo[]> {
+    const results: RemoteDirInfo[] = [];
+    const responses = readMultistatus(xml, ctx);
+    for (let i = 0; i < responses.length; i++) {
+      if (i > 0 && i % PARSE_YIELD_EVERY === 0) await new Promise((r) => window.setTimeout(r, 0));
+      const resp = responses[i];
+      const prop = readProp(resp);
+      if (!prop) continue;
+      if (!readIsCollection(prop)) continue; // mirror of parsePropfindResponse: here we KEEP only collections.
+
+      const path = hrefToRelative(this.baseUrl, this.remoteBase, readHref(resp));
+      if (path === null || path === '') continue; // outside the base folder, or the base folder itself
+      const { etag, lastModified } = readDavProps(prop);
+      const { fileId } = readOwncloudProps(prop);
+      results.push({ path, fileId, etag, lastModified });
+    }
+    return results;
+  }
+
+  private async parseSyncChanges(
+    xml: string, ctx: { op: string; path: string; status: number; method: 'PROPFIND' | 'REPORT' },
+  ): Promise<SyncChanges> {
+    const modified: RemoteFileInfo[] = [];
+    const deleted: string[] = [];
+    // Validate FIRST: an unreadable body must never resolve to "no changes, empty token" — that
+    // reads as "in sync" and stalls the vault exactly like an unreadable getFiles would (feature 087).
+    const responses = readMultistatus(xml, ctx);
+    const newSyncToken = readSyncToken(xml);
+
+    for (let i = 0; i < responses.length; i++) {
+      // Yield periodically (anti-ANR) — see parsePropfindResponse.
+      if (i > 0 && i % PARSE_YIELD_EVERY === 0) await new Promise((r) => window.setTimeout(r, 0));
+      const resp = responses[i];
+      const path = hrefToRelative(this.baseUrl, this.remoteBase, readHref(resp));
+      if (path === null || path === '') continue; // Skip entries outside the base folder or the folder itself
+      if (readStatusText(resp)?.includes('404')) {
+        deleted.push(path);
+        continue;
+      }
+      const prop = readProp(resp);
+      if (!prop) continue;
+      const { etag, size, lastModified } = readDavProps(prop);
+      const { checksum, fileId } = readOwncloudProps(prop);
+      modified.push({ path, fileId, checksum, etag, size, lastModified });
+    }
+    return { modified, deleted, newSyncToken };
+  }
+}

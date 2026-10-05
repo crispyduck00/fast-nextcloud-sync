@@ -1,0 +1,750 @@
+// Shared type definitions for nextcloud-sync
+
+/**
+ * Opt-in flags for `.obsidian` config-folder sync (issue #1). Each flag is only consulted when the
+ * master `syncConfigFolder` setting is on. Community plugins and the plugin's own sync-state DB are
+ * intentionally NOT representable here — they are permanent hard exclusions.
+ *
+ * Feature 029 collapsed the former five categories into two: Bookmarks stays on its own, and
+ * everything else (appearance, themes & snippets, hotkeys, core-plugin settings) is grouped under
+ * `others`. The detailed file mapping lives in `ConfigSyncResolver.CONFIG_SYNC_CATEGORIES`.
+ */
+export interface ConfigSyncCategories {
+  /** bookmarks.json (migrated from the former standalone `syncBookmarks` setting) */
+  bookmarks: boolean;
+  /**
+   * appearance.json / app.json, themes/** and snippets/**, hotkeys.json, and the core-plugin
+   * config files (the fixed allowlist). Grouped from the former appearance/themesSnippets/
+   * hotkeys/corePlugins categories (feature 029).
+   */
+  others: boolean;
+}
+
+/**
+ * Conflict-resolution strategy for one file type (feature 037). A single per-type choice replaces the
+ * former three conflict settings (autoMergeEnabled / conflictFailurePolicy / frontmatterConflictStrategy).
+ *   merge        — 3-way merge: clean → merged, text conflict → markers, non-text → safe-hold (FR-005a)
+ *   biggest-size — keep the larger side, overwrite the smaller (size tie → no-op success, FR-009)
+ *   latest-mtime — keep the newer side, overwrite the older (mtime tie → no-op success, FR-009)
+ *   local-win    — always keep the local side, overwrite remote
+ *   remote-win   — always keep the remote side, overwrite local
+ * `merge` is valid only for Auto Merge File types; Other File types use the four deterministic ones.
+ */
+export type SyncStrategy = 'merge' | 'biggest-size' | 'latest-mtime' | 'local-win' | 'remote-win';
+
+/**
+ * Feature 048: the SECOND-level fallback applied ONLY to a part that a primary `merge` strategy could
+ * not auto-resolve (a body diff3 conflict region, or a frontmatter scalar/object both-changed clash).
+ *   conflict-markers — body keeps both sides as `<<<<<<< / >>>>>>>` markers (flagged conflicted);
+ *                      frontmatter cannot hold markers, so it falls back to latest-mtime; binary body
+ *                      cannot hold markers either, so it safe-holds (both sides untouched).
+ *   latest-mtime / local-win / remote-win / biggest-size — resolve the conflicting part deterministically
+ *                      (per body region / per frontmatter field). A biggest-size tie falls to latest-mtime.
+ * A primary strategy other than `merge` is already deterministic, so it never reaches this fallback.
+ */
+export type ConflictStrategy = 'conflict-markers' | 'biggest-size' | 'latest-mtime' | 'local-win' | 'remote-win';
+
+/**
+ * Runtime inputs for the merge, threaded from ConflictContext. The two mtimes drive latest-mtime
+ * tiebreaks; `conflictStrategy` (feature 048) resolves a frontmatter scalar clash or a body diff3
+ * conflict region that a primary `merge` could not auto-resolve. Absent when no ConflictContext is
+ * available (e.g. unit tests): mtimes default to 0 (remote wins the tie) and conflictStrategy defaults
+ * to 'conflict-markers'.
+ */
+export interface MergeContext {
+  /** Local file modification time in milliseconds since epoch. */
+  localMtime: number;
+  /** Remote file modification time in milliseconds since epoch. */
+  remoteMtime: number;
+  /** Feature 048: how to resolve a part a primary `merge` could not auto-resolve. */
+  conflictStrategy?: ConflictStrategy;
+}
+
+/**
+ * Feature 044: the two CLEAN versions of a note captured at the moment a marker conflict is detected,
+ * before `resolveByWrite` overwrites either side with conflict-marker content. Stored per-path in
+ * CleanSideStore so force-resolution ("Use remote" / "Use local" / "Latest" / "Biggest") recovers a
+ * real clean version instead of the marker-corrupted current content. Distinct from the feature-038
+ * merge base (which holds ONE last-converged body, i.e. neither current side).
+ */
+export interface CleanSideSnapshot {
+  /** Clean LOCAL body (the user's pre-merge edit), captured before markers overwrote it. */
+  local: string;
+  /** Clean REMOTE body (downloaded during conflict handling), before markers were uploaded. */
+  remote: string;
+  /** Local file mtime at conflict time (ms) — discriminator for the "Latest modified" choice. */
+  localMtime: number;
+  /** Remote lastModified at conflict time (ms) — discriminator for "Latest modified". */
+  remoteMtime: number;
+  /** Clean local body size in bytes — discriminator for the "Biggest size" choice. */
+  localSize: number;
+  /** Clean remote body size in bytes — discriminator for "Biggest size". */
+  remoteSize: number;
+}
+
+export interface DavSyncSettings {
+  serverUrl: string;
+  username: string;
+  /**
+   * Reference ID for the app password stored in Obsidian SecretStorage.
+   * The actual password value is never saved in data.json; secretStorage manages it encrypted.
+   */
+  passwordSecretId: string;
+  /** Auto-sync period in minutes. 0 = manual only. Disabled on mobile (the OS suspends timers). */
+  syncIntervalMinutes: number;
+  /** WebDAV request timeout in seconds. */
+  networkTimeoutSeconds: number;
+  deviceId: string;
+  /** Absolute file-size cap (MB). Files exceeding this are skipped with a warning. 0 = unlimited. */
+  maxFileSizeMB: number;
+  /** Detect local vault changes and sync immediately (watch mode). Android supports opt-in foreground watch. */
+  watchOnChangeEnabled: boolean;
+  /**
+   * One-time migration marker for the release that first enables Android watch mode.
+   * 0/absent = a persisted true may be a formerly-inert desktop/copied value and must not activate
+   * automatically on Android; 1 = the Android user has crossed that migration boundary.
+   */
+  mobileWatchMigrationVersion?: number;
+  /** Use Nextcloud Client Push (notify_push) as a best-effort remote-change trigger. */
+  useClientPush: boolean;
+  /** Optional WebSocket endpoint override. Empty = auto-detect from Nextcloud capabilities. */
+  clientPushUrlOverride: string;
+  /**
+   * Startup sync delay in seconds, 0–10. 0 = no startup sync; 1–10 = wait that long after startup
+   * before syncing. Default 1 (enabled). Folds the former `syncOnStartupEnabled` toggle (feature 034
+   * rev): default ON on all platforms, mobile included (feature 030).
+   */
+  startupSyncDelaySeconds: number;
+  /** Number of concurrent WebDAV requests. Derived from device RAM on first run if not persisted. */
+  networkConcurrency: number;
+  /**
+   * Sync only on Wi-Fi (non-cellular). Not supported on iOS (no network-type API);
+   * the toggle is disabled there and the setting is ignored.
+   */
+  syncOnWifiOnly: boolean;
+  // Feature 033: chunkedUploadEnabled and fileLockingEnabled were removed (chunked upload is always
+  // on, file locking always off). Both are now fixed in src/util/fixedSyncConfig.ts.
+  /**
+   * Feature 049: mass-delete circuit-breaker limit (Advanced / caution). Caps how many local files or
+   * folders a single sync may delete via absence-based remote-deletion detection — the guard that
+   * prevents a partial/failed remote listing from wiping the vault.
+   *   -1 (default) = AUTOMATIC — the built-in dynamic limit max(20, 20% of tracked files) (safe).
+   *    0           = UNLIMITED — the breaker never fires (RISKY: a partial listing can delete everything).
+   *    N > 0       = a fixed absolute limit — the breaker fires when a sync would delete more than N.
+   */
+  massDeleteLimit: number;
+  /**
+   * Master opt-in for syncing parts of the Obsidian config folder (Vault#configDir, e.g. `.obsidian`).
+   * Default OFF. While off, nothing under the config folder is synced (notes-only behaviour).
+   * When on, the individual `configSync` categories below decide what is included.
+   * Community plugins (`<configDir>/plugins/`) and this plugin's own state DB are NEVER synced,
+   * regardless of these flags.
+   */
+  syncConfigFolder: boolean;
+  /** Per-category opt-in for config-folder sync. Only consulted when `syncConfigFolder` is true. */
+  configSync: ConfigSyncCategories;
+  /** User-facing device label. Empty ⇒ derive "<platform>-<deviceId6>". Sanitized for filenames at use sites. */
+  deviceName: string;
+  /** Vault-relative folder holding both log files. Blank ⇒ vault root. */
+  logsFolder: string;
+  /** Master on/off for all log output (sync log + debug log). */
+  loggingEnabled: boolean;
+  // Feature 033: maxConflictRegions was removed (always unlimited; fixed in fixedSyncConfig.ts).
+  /**
+   * File extensions classified as "Auto Merge File" (feature 037; continues the role of the former
+   * `mergeableExtensions`). Lowercase, no leading dot. A conflict on a file whose extension is in
+   * this list is resolved with `autoMergeFileStrategy`; every other file (including extensionless
+   * files) uses `otherFileStrategy`. An empty list routes ALL files through `otherFileStrategy`.
+   */
+  autoMergeFileTypes: string[];
+  /**
+   * Conflict strategy for Auto Merge File types (feature 037). Default `merge`. All five strategies
+   * are valid here. When `merge`: clean 3-way → merged, text conflict → markers, non-text → safe-hold.
+   */
+  autoMergeFileStrategy: SyncStrategy;
+  /**
+   * Conflict strategy for every other file type (feature 037). Default `latest-mtime`. `merge` is not
+   * offered here — only the four deterministic strategies (biggest-size / latest-mtime / local/remote-win).
+   */
+  otherFileStrategy: Exclude<SyncStrategy, 'merge'>;
+  // Feature 033: explorerCompareEnabled was removed. The "Compare with remote" explorer menu item and
+  // command are registered unconditionally in main.ts, so no setting gates them.
+  /**
+   * User-managed list of vault-relative folder paths that are never synced (feature 027).
+   * Folder-prefix match at a folder boundary; entries are normalized and unique. This is an
+   * additive layer on top of the permanent hard exclusions (dotfolders, community plugins,
+   * the plugin's own state DB), which always apply regardless of this list.
+   */
+  excludedFolders: string[];
+  /**
+   * How to resolve a conflict on a markdown file's frontmatter block, INDEPENDENTLY of the body
+   * (feature 047). Same five strategies as `autoMergeFileStrategy`. `merge` = semantic merge (arrays
+   * base-aware set-merge, scalars/objects/parse-failure tie-broken by latest-mtime); the other four
+   * adopt one whole side's frontmatter block. Applies to every `.md` regardless of body classification.
+   * Default: 'merge'. Replaces the former experimental `frontmatterScalarConflictPolicy`.
+   */
+  frontmatterStrategy: SyncStrategy;
+  /**
+   * Feature 048: second-level fallback applied ONLY to a part a primary `merge` could not auto-resolve
+   * (a body diff3 conflict region, or a frontmatter scalar/object both-changed clash). Lets the user
+   * keep attempting a merge but choose the outcome on a real conflict instead of always writing markers.
+   * Default 'conflict-markers' reproduces the feature-047 behaviour (both sides kept as markers, no data
+   * loss). A deterministic primary strategy (biggest-size / latest-mtime / local/remote-win) never
+   * conflicts, so this setting is inert for it.
+   */
+  conflictStrategy: ConflictStrategy;
+  /**
+   * Persisted Sync Status dialog filter selection: the checked status keys, serialized as an array.
+   * Absent ⇒ all statuses shown (default). Restored on load and saved on every toggle, so the
+   * selection survives an Obsidian restart. Unknown keys are ignored on load.
+   */
+  statusFilter?: SyncFileOp[];
+  /**
+   * Last Nextcloud server version observed at connect time. Used only to show a
+   * recommendation banner in settings when it is below the recommended minimum.
+   * Empty/undefined until the first successful connection.
+   */
+  lastKnownServerVersion?: string;
+}
+
+export const DEFAULT_SETTINGS: DavSyncSettings = {
+  serverUrl: '',
+  username: '',
+  passwordSecretId: '',
+  syncIntervalMinutes: 15,
+  networkTimeoutSeconds: 30,
+  deviceId: '',
+  maxFileSizeMB: 0, // 0 = unlimited (desktop default). Mobile gets a safe cap in loadSettings().
+  watchOnChangeEnabled: true, // Mobile first-run: false (applied in loadSettings()).
+  mobileWatchMigrationVersion: 0,
+  useClientPush: false,
+  clientPushUrlOverride: '',
+  startupSyncDelaySeconds: 1, // 0 = no startup sync; default 1 = enabled with a 1 s delay.
+  networkConcurrency: 16, // First-run: overridden by autoNetworkConcurrency() in loadSettings(); persisted value is kept on subsequent loads.
+  // Desktop default OFF; mobile's first run flips it ON in loadSettings() (metered data).
+  syncOnWifiOnly: false,
+  // Feature 049: -1 = automatic dynamic breaker (safe default). 0 = unlimited (opt-in, risky). N = fixed.
+  massDeleteLimit: -1,
+  // Config-folder sync is opt-in: master defaults OFF, so a fresh install syncs notes only.
+  // These category defaults take effect only once the user turns the master on.
+  // Migrated `syncBookmarks: true` users get bookmarks-only instead
+  // (see migrateBookmarksToConfigSync); `syncBookmarks` itself is removed and pruned.
+  syncConfigFolder: false,
+  configSync: {
+    bookmarks: true,
+    others: true,
+  },
+  deviceName: '',
+  logsFolder: '',
+  loggingEnabled: false,
+  // Conflict strategies (feature 037): a single per-type choice. Defaults reproduce the prior felt
+  // behaviour — Auto Merge File types attempt a 3-way merge, everything else takes the newer side.
+  // Clearing autoMergeFileTypes routes every file through otherFileStrategy (no merge attempted).
+  // Feature 048: `md` is NOT listed — markdown is always special-cased (frontmatter → frontmatterStrategy,
+  // body → autoMergeFileStrategy) regardless of this list, which now only classifies NON-markdown text.
+  autoMergeFileTypes: ['txt', 'cpp', 'py', 'c', 'h', 'hpp', 'rs', 'go', 'ts', 'js', 'java', 'sh'],
+  autoMergeFileStrategy: 'merge',
+  otherFileStrategy: 'latest-mtime',
+  excludedFolders: [],
+  frontmatterStrategy: 'merge',
+  // Feature 048: default keeps the 047 behaviour — a real merge conflict writes both-side markers.
+  conflictStrategy: 'conflict-markers',
+  // Explicit `undefined` keeps the key in the allowlist used by pruneObsoleteSettings (so a saved
+  // selection is never pruned) while meaning "no saved selection → all statuses shown".
+  statusFilter: undefined,
+  lastKnownServerVersion: '',
+};
+
+export type RemoteIdType = 'sha256' | 'sha1' | 'etag' | 'size';
+
+export interface FileState {
+  path: string;
+  localHash: string;
+  remoteId: string;
+  idType: RemoteIdType;
+  size: number;
+  mtime: number;
+  remoteFileId: string | null;
+  isConflicted: boolean;
+  /**
+   * Local stat signature captured by re-stat IMMEDIATELY AFTER the plugin's own write/download.
+   * This is the change-detection fast-path key that works on mobile, where `setMtime()` is a no-op
+   * (Node fs.utimes is desktop-only) so the on-disk mtime never matches the remote mtime. Optional
+   * for backward compatibility: a state file without these triggers exactly one reconciling hash,
+   * after which the fields are populated. See data-model.md §1.
+   */
+  localMtime?: number;
+  /** Local size observed at the same moment as `localMtime` (see above). */
+  localSize?: number;
+  /**
+   * Server `lastModified` for the last converged state, kept separate from `localMtime` so remote
+   * change detection is unaffected by the local write timestamp.
+   */
+  remoteMtime?: number;
+}
+
+/**
+ * A tracked directory (WebDAV collection). Directories are first-class, contentless entities,
+ * symmetric with files: a directory present on one side and absent on the other is a creation or
+ * a deletion to propagate — NOT something derived from whether it holds files. `remoteFileId`
+ * (oc:fileid) is stable across MOVE for rename detection.
+ */
+export interface DirState {
+  path: string;
+  remoteFileId: string | null;
+}
+
+export interface SyncState {
+  deviceId: string;
+  lastSyncTime: number;
+  syncToken: string | null;
+  files: Record<string, FileState>;
+  /** Tracked directories (optional for back-compat with pre-DP v1 state files → defaults to {}). */
+  directories?: Record<string, DirState>;
+  /**
+   * Root-ETag short-circuit (spec 023): the vault root collection's ETag captured at the end of the
+   * last REAL full scan. Optional for back-compat (absent ⇒ next sync does a real full scan). A
+   * matching current root ETag means the remote tree is unchanged since that scan, so the remote
+   * listing can be rebuilt from `files`/`directories` instead of a Depth:infinity PROPFIND.
+   */
+  remoteRootEtag?: string | null;
+  /** Consecutive short-circuited full-scans since the last real scan (FORCE_FULL_SCAN_EVERY bounds it). */
+  fullScanSkipCount?: number;
+}
+
+export interface NextcloudFeatures {
+  isNextcloud: boolean;
+  version: string;
+  hasChecksums: boolean;
+  hasFilesLocking: boolean;
+  /** Server advertises (or feature-probed positive for) the bulk-upload endpoint `/remote.php/dav/bulk`. */
+  hasBulkUpload: boolean;
+  syncToken: string | null;
+}
+
+export interface RemoteFileInfo {
+  path: string;
+  fileId: string | null;
+  checksum: string | null;
+  etag: string | null;
+  size: number;
+  lastModified: number;
+}
+
+/**
+ * A remote directory (WebDAV collection). Directories carry no content hash/size;
+ * `fileId` (oc:fileid) is stable across MOVE and identifies the collection for
+ * rename detection. Surfaced separately from files so empty-directory pruning can
+ * derive "which collections hold no descendant file" from a full listing.
+ */
+export interface RemoteDirInfo {
+  path: string;
+  fileId: string | null;
+  etag: string | null;
+  lastModified: number;
+}
+
+export interface SyncChanges {
+  modified: RemoteFileInfo[];
+  deleted: string[];
+  newSyncToken: string;
+}
+
+export interface MergeResult {
+  success: boolean;
+  mergedContent: string;
+  hadConflicts: boolean;
+  conflictRegions: number;
+  /**
+   * Feature 039 (FR-039-5): the merged output contains NESTED/stacked plugin conflict markers — the
+   * fingerprint of marker re-entrancy that the upstream guard somehow missed. The caller must
+   * safe-hold (write nothing, push nothing) instead of persisting the corrupt body. Optional/additive.
+   */
+  hold?: boolean;
+}
+
+/**
+ * The action a ConflictResolver decides on for a conflicting file (feature 037). The decision is pure
+ * (no I/O); SyncEngine.handleConflict executes the corresponding network/disk operations. Every
+ * conflict is decided — there is no user-selectable "hold/error" strategy (FR-010).
+ *   write         — write `content` locally (clean merge or marker-embedded text), then converge to server
+ *   prefer-local  — overwrite the remote with the local copy
+ *   prefer-remote — overwrite the local with the remote copy
+ *   safe-hold     — non-text / unmergeable under `merge`: leave BOTH sides untouched and flag the file
+ *                   conflicted, writing NO markers (binary-safe, FR-005a). Not an error; resolves on a
+ *                   later sync once a side changes or the user resolves it.
+ *   no-op         — deterministic-strategy tie (equal size for biggest-size / equal mtime for
+ *                   latest-mtime): leave BOTH sides untouched, NOT conflicted, success (FR-009).
+ *                   Re-evaluated on the next sync.
+ */
+export type ConflictResolution =
+  | { action: 'write'; content: string; clean: boolean }
+  | { action: 'prefer-local' }
+  | { action: 'prefer-remote' }
+  | { action: 'safe-hold' }
+  | { action: 'no-op' };
+
+/** One recorded sync error: the file it happened on (empty for session-level errors) and why. */
+export interface SyncErrorDetail {
+  path: string;
+  message: string;
+  /**
+   * Skipped deletion candidate paths (full, uncapped), set only when the FILE (absence-deletion)
+   * mass-delete breaker fires. The modal derives a capped inline preview from `all` at render time;
+   * the full list also backs the "open report note" action (feature 056).
+   */
+  skippedPaths?: {
+    all: string[];
+  };
+  /**
+   * Full, uncapped, category-split candidate paths, set only when the DIR mass-delete breaker
+   * fires (mutually exclusive with `skippedPaths`, which the file-side breaker uses instead).
+   * `deleteRemote`/`trashLocal` mirror reconcileDirectories' own candidate categories, so a bulk
+   * resolution (`SyncEngine.resolveAllSkippedDirs`) knows which primitive to apply per path.
+   */
+  dirBreakerSkipped?: {
+    deleteRemote: string[];
+    trashLocal: string[];
+  };
+}
+
+/** The outcome recorded for a single file during a sync, shown in the status dialog's history. */
+export type SyncFileOp =
+  | 'uploaded' | 'downloaded' | 'deleted' | 'merged' | 'conflicted'
+  | 'local-wins' | 'remote-wins' | 'error';
+
+/** Optional checksum/size detail captured for a sync-history entry (for the sync log). */
+export interface SyncHistoryDetail {
+  /** Local content checksum (sha256) when known. */
+  localHash?: string;
+  /** Remote identifier (content hash / etag / size) when known. */
+  remoteId?: string;
+  /** Qualifies `remoteId` so an etag is not mistaken for a content hash. */
+  remoteIdType?: RemoteIdType;
+  /** Local file size in bytes when known. */
+  localSize?: number;
+  /** Remote file size in bytes when known. */
+  remoteSize?: number;
+}
+
+/** One per-file sync-history entry, persisted across restarts and pruned to a rolling window. */
+export interface SyncHistoryEntry extends SyncHistoryDetail {
+  path: string;
+  op: SyncFileOp;
+  /** Epoch milliseconds when the operation was recorded. */
+  at: number;
+  /** Failure reason — present only for `op: 'error'`. */
+  message?: string;
+  /**
+   * Start time (epoch ms) of the sync run that produced this entry — the run's `summary.startedAt`
+   * for a full sync, or the op's own time for a watch-mode single-file op. Used to group the Sync
+   * Status dialog's recent activity by sync run. Optional for backward compatibility: entries
+   * recorded before this field existed are grouped by their own `at` (best-effort).
+   */
+  runStartedAt?: number;
+}
+
+export interface SyncSessionSummary {
+  startedAt: number;
+  completedAt: number | null;
+  uploadedCount: number;
+  downloadedCount: number;
+  deletedCount: number;
+  /** Files where both sides existed and auto-merge produced a clean result (no markers). */
+  mergedCount: number;
+  /** Files where both sides existed and merge left `>>>>` conflict markers for the user. */
+  conflictedCount: number;
+  errorCount: number;
+  retriedFiles: string[];
+  /** Per-error details behind errorCount, shown in the sync status dialog. */
+  errors: SyncErrorDetail[];
+}
+
+export type SyncStatus = 'idle' | 'syncing' | 'error' | 'conflict';
+
+/** Debug merge preview for a single file: the two sides and the content a sync would write. */
+export interface MergePreview {
+  path: string;
+  localExists: boolean;
+  remoteExists: boolean;
+  /** Current local content (the "before" side). */
+  local: string;
+  /** Current remote content. */
+  remote: string;
+  /** Content a real sync would write (the "after" side): merged result or conflict-marked text. */
+  after: string;
+  /** True when the merge resolved cleanly with no markers remaining. */
+  clean: boolean;
+}
+
+/**
+ * Read-only comparison of one file against its remote counterpart, for the explorer
+ * "Compare with remote" popup. Produced by SyncEngine.compareWithRemote — it never mutates.
+ * `state` distinguishes a successful comparison from a missing remote or a fetch failure;
+ * the UI shows a separate (non-result) loading state while the promise is pending.
+ */
+export interface RemoteCompareResult {
+  path: string;
+  state: 'ok' | 'remote-missing' | 'error';
+  /** User-readable failure reason — present only when state === 'error'. */
+  errorMessage?: string;
+  localExists: boolean;
+  remoteExists: boolean;
+  /** Modification times (epoch ms); null when the corresponding side is absent. */
+  localMtime: number | null;
+  remoteMtime: number | null;
+  /** Lowercase hex SHA-256 over raw bytes; null when the side is absent. */
+  localChecksum: string | null;
+  remoteChecksum: string | null;
+  /** True iff both checksums are present and equal. */
+  checksumMatch: boolean;
+  /** Decoded text for the diff; null for binary/non-text files or an absent side. */
+  localText: string | null;
+  remoteText: string | null;
+  /** True only for text-eligible files with both sides present. */
+  diffAvailable: boolean;
+  /** Sizes in bytes; null when the side is absent. */
+  localSize: number | null;
+  remoteSize: number | null;
+}
+
+// ── US1: Login Flow v2 ──────────────────────────────────────────────────────
+
+/** Login Flow v2 init response (POST /index.php/login/v2). */
+export interface LoginFlowInit {
+  /** Token used for polling. */
+  pollToken: string;
+  /** Absolute URL to poll. */
+  pollEndpoint: string;
+  /** Login approval URL to open in the browser. */
+  loginUrl: string;
+}
+
+/** Login Flow v2 polling result (discriminated union). */
+export type LoginFlowResult =
+  | { status: 'success'; server: string; loginName: string; appPassword: string }
+  | { status: 'pending' }
+  | { status: 'timeout' }
+  | { status: 'unsupported' };
+
+// ── US2: File Versions ──────────────────────────────────────────────────────
+
+/** A past version of a single file held on the server. */
+export interface FileVersion {
+  /** Trailing identifier of versions/{fileId}/{versionId}. */
+  versionId: string;
+  /** Remote path used for GET/MOVE (the versions namespace, separate from the files root). */
+  href: string;
+  /** Last modified (epoch milliseconds). */
+  lastModified: number;
+  /** Size in bytes. */
+  size: number;
+  /** Optional user-defined Nextcloud version label. */
+  label?: string;
+  /** Nextcloud user id recorded as the author of this retained version. */
+  author?: string | null;
+  /** MIME type reported for the retained version. */
+  mimeType?: string;
+  /** Version ETag, when exposed by the server. */
+  etag?: string;
+  /** Whether Nextcloud reports that a preview can be generated. */
+  hasPreview?: boolean;
+  /**
+   * True when this DAV version represents the current remote file. Nextcloud includes the current
+   * revision in the versions collection; consumers must download it through the normal files DAV
+   * endpoint rather than treating it as a restorable historical snapshot.
+   */
+  isCurrent?: boolean;
+}
+
+// Custom errors
+export class SyncTokenExpiredError extends Error {
+  constructor() { super('sync-token expired (HTTP 410)'); this.name = 'SyncTokenExpiredError'; }
+}
+export class ConflictError extends Error {
+  constructor(public readonly path: string) {
+    super(`Conflict at ${path}`); this.name = 'ConflictError';
+  }
+}
+/**
+ * A remote request that came back with an unusable status.
+ *
+ * `method` (feature 065) names the HTTP verb that failed, so a sync error reads "HTTP 404 (GET)"
+ * instead of a bare "HTTP 404" — without it, a 404 could equally be a download, an upload, or a
+ * PROPFIND, and issue #25 showed that ambiguity alone can stall a diagnosis. It is optional so the
+ * body-only call form still compiles, and the message keeps `HTTP <status>` as its PREFIX so
+ * anything matching on that shape is unaffected. The response body is deliberately NOT part of the
+ * message: it is server-controlled text that ends up in logs users paste into public issues.
+ */
+export class NetworkError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly body: string,
+    public readonly method?: string,
+  ) {
+    super(method ? `HTTP ${status} (${method})` : `HTTP ${status}`);
+    this.name = 'NetworkError';
+  }
+}
+/**
+ * The vault folder itself is absent from the server: a Depth:infinity PROPFIND of the sync root came
+ * back 404 (feature 083, GitHub issue #50).
+ *
+ * This is deliberately NOT the same signal as "the vault folder is there and holds no files". An
+ * empty listing is the server's truth about its contents and drives absence-based deletion; a
+ * missing folder says nothing about any individual file, and the plugin — not the user — chose that
+ * folder's remote path from the vault name, so the user cannot be expected to recreate it. The
+ * engine answers this by creating the folder and re-seeding it from local, never by deleting.
+ *
+ * Extends NetworkError (status 404) so every existing `instanceof NetworkError` branch — the retry
+ * queue, error reporting — keeps classifying it exactly as it did before.
+ */
+export class RemoteRootMissingError extends NetworkError {
+  constructor() {
+    super(404, '', 'PROPFIND');
+    this.name = 'RemoteRootMissingError';
+  }
+}
+/**
+ * The server answered a listing request with 207, but the body is not something a listing can be
+ * read from (feature 087, GitHub issue #51): empty, truncated, an HTML error page passed through a
+ * proxy, or well-formed XML that is not a DAV:multistatus at all.
+ *
+ * This is deliberately NOT an empty listing. An empty listing is the server's statement that the
+ * folder holds nothing, and the full scan acts on that statement by treating every tracked file as
+ * deleted remotely. A body that could not be read says nothing about any file, and the only safe
+ * reading of it is "this sync learned nothing" — which is what a thrown NetworkError produces.
+ *
+ * The message is the whole diagnostic: the clients have no logger, and every caller that catches a
+ * failed listing already logs `err.message` and records it in the session summary. So it names the
+ * call, the path, the status, the body length and the reason, plus the first characters of the body
+ * — enough to tell a truncated multistatus from a proxy's HTML page, never the body itself.
+ */
+export class RemoteListingUnreadableError extends NetworkError {
+  readonly op: string;
+  readonly path: string;
+  readonly bodyLength: number;
+  readonly reason: string;
+  readonly fragment: string;
+  constructor(
+    ctx: { op: string; path: string; status: number; method: 'PROPFIND' | 'REPORT' },
+    xml: string,
+    reason: string,
+  ) {
+    // `body` stays empty on purpose: NetworkError.body carries the raw response for other errors,
+    // but this one can reach the Sync status dialog and a user's debug log, and a multi-megabyte
+    // listing — or a proxy page — has no business there.
+    super(ctx.status, '', ctx.method);
+    this.name = 'RemoteListingUnreadableError';
+    this.op = ctx.op;
+    this.path = ctx.path;
+    this.reason = reason;
+    this.bodyLength = new TextEncoder().encode(xml).length;
+    this.fragment = xml.slice(0, 256).replace(/\s+/g, ' ').trim();
+    this.message =
+      `Remote listing unreadable: ${ctx.method} ${ctx.op} '${ctx.path}' → HTTP ${ctx.status}, ` +
+      `${this.bodyLength} bytes, ${reason}; body starts: ${this.fragment}`;
+  }
+}
+/**
+ * A parent collection could not be created, so the write that needed it has nowhere to land
+ * (feature 088).
+ *
+ * WebDAV's PUT does not create parent collections, so an upload into a folder the server has never
+ * seen MKCOLs the ancestors first. Until now a MKCOL that failed was indistinguishable from one that
+ * succeeded: the loop ignored the status entirely, and the only thing the user ever saw was the
+ * retried PUT coming back as `HTTP 404 (PUT)` — a message that names neither the folder that could
+ * not be created nor the reason. This error carries both.
+ *
+ * `dirPath` is the ANCESTOR that failed, not the file being written: with `F/sub/note.md` the
+ * interesting fact is that `F` could not be created, and `F/sub` was never even attempted.
+ *
+ * Extends NetworkError so the existing "a network failure fails this one file and is retried on the
+ * next sync" handling applies unchanged — the same reasoning as RemoteListingUnreadableError.
+ */
+export class RemoteDirCreateError extends NetworkError {
+  readonly dirPath: string;
+  constructor(dirPath: string, status: number, detail?: string) {
+    // `body` stays empty: this message can reach the Sync status dialog, and a server's error page
+    // has no business there. `status` 0 means the request threw rather than answering.
+    super(status, '', 'MKCOL');
+    this.name = 'RemoteDirCreateError';
+    this.dirPath = dirPath;
+    this.message =
+      `Could not create the remote folder '${dirPath}': MKCOL ${status === 0 ? 'failed' : `→ HTTP ${status}`}` +
+      (detail ? ` (${detail})` : '');
+  }
+}
+/**
+ * A PUT or DELETE came back 423 because another WebDAV client (or the server itself) holds a lock on
+ * the remote path (feature 090).
+ *
+ * This is deliberately NOT the same signal as `FileLockedError`, which is this plugin's own
+ * cooperative lock (`LOCK` method, `TransferService.acquireLock`). A `ServerLockedError` names a lock
+ * this plugin did not take and cannot release, so the only safe response is to skip the file for this
+ * cycle and retry it on the next one — never to force through it.
+ *
+ * `lockOwner` comes from a best-effort PROPFIND lockdiscovery read: when that read succeeds it names
+ * who holds the lock, and when it fails or cannot be parsed the caller throws a plain `NetworkError`
+ * instead of this class (see specs/090-server-lock-force-resolve/data-model.md).
+ *
+ * Extends NetworkError (status 423) so every existing `instanceof NetworkError` branch — the retry
+ * queue, error recording, Notice generation — keeps classifying it exactly as it did before.
+ */
+export class ServerLockedError extends NetworkError {
+  constructor(
+    public readonly path: string,
+    method: 'PUT' | 'DELETE',
+    public readonly lockOwner: string | null,
+  ) {
+    super(423, '', method);
+    this.name = 'ServerLockedError';
+    this.message = this.lockOwner
+      ? `HTTP 423 (${method}) — locked on the server by "${this.lockOwner}"`
+      : `HTTP 423 (${method}) — locked on the server (owner unknown)`;
+  }
+}
+/**
+ * Result of {@link IWebDAVClient.createVaultRoot}: whether the MKCOL actually created the vault
+ * folder (201) or found it already present (405). The distinction is the PROOF that decides whether
+ * a re-seed may proceed — see specs/083-empty-listing-absence-delete/contracts/vault-root.md.
+ */
+export type VaultRootOutcome = 'created' | 'exists';
+export class MaintenanceModeError extends Error {
+  constructor() { super('Nextcloud is in maintenance mode'); this.name = 'MaintenanceModeError'; }
+}
+export class CredentialsNotFoundError extends Error {
+  constructor() { super('App password not found in credentials'); this.name = 'CredentialsNotFoundError'; }
+}
+/** A Nextcloud-specific feature was invoked on a client that does not support it (standard WebDAV). */
+export class FeatureUnsupportedError extends Error {
+  constructor(public readonly feature: string) {
+    super(`Feature not supported on this server: ${feature}`);
+    this.name = 'FeatureUnsupportedError';
+  }
+}
+/** Failed to start or poll Login Flow v2. */
+export class LoginFlowError extends Error {
+  constructor(public readonly reason: string) {
+    super(`Login Flow failed: ${reason}`);
+    this.name = 'LoginFlowError';
+  }
+}
+/** The target file is locked by another client (HTTP 423). */
+export class FileLockedError extends Error {
+  constructor(public readonly path: string) {
+    super(`File is locked: ${path}`);
+    this.name = 'FileLockedError';
+  }
+}
+/**
+ * An `If-Match` / `If-None-Match` precondition failed (HTTP 412): the remote file changed since the
+ * validator (etag) we sent, so the upload was refused to prevent a lost update. The engine converts
+ * this into a conflict (download remote + resolve) instead of overwriting.
+ */
+export class PreconditionFailedError extends Error {
+  constructor(public readonly path: string) {
+    super(`Precondition failed (remote changed): ${path}`);
+    this.name = 'PreconditionFailedError';
+  }
+}

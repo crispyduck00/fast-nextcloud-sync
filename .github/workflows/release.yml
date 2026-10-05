@@ -1,0 +1,100 @@
+name: Release Obsidian plugin
+
+# Triggered by pushing a bare version-number tag (e.g. 1.0.0, no "v" prefix).
+# Following the Obsidian community-plugin release convention, the tag name == manifest.json version.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+  id-token: write      # for build-provenance OIDC
+  attestations: write  # to record artifact attestations
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        # No version here on purpose: the action reads packageManager from package.json, so that
+        # field is the one place the pnpm version is written down. Pinning it here too let CI and
+        # the developers' machines drift apart silently.
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build plugin
+        run: pnpm run build
+
+      - name: Verify tag matches manifest version
+        run: |
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          TAG="${GITHUB_REF_NAME}"
+          if [ "$MANIFEST_VERSION" != "$TAG" ]; then
+            echo "::error::Tag ($TAG) does not match manifest.json version ($MANIFEST_VERSION)."
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Collect release assets
+        id: assets
+        run: |
+          ASSETS="main.js manifest.json"
+          if [ -f styles.css ]; then
+            ASSETS="$ASSETS styles.css"
+          fi
+          echo "files=$ASSETS" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Tags containing a hyphen (e.g. 0.2.0-beta.1) are published as pre-releases
+          # so BRAT beta testers can opt in without affecting the stable community listing.
+          PRERELEASE=""
+          case "${GITHUB_REF_NAME}" in *-*) PRERELEASE="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            $PRERELEASE \
+            ${{ steps.assets.outputs.files }}
+
+      - name: Clean up beta pre-releases superseded by this stable release
+        # Runs only for stable releases. Skips for pre-release tags containing a hyphen
+        # (e.g. 0.2.0-beta.1) so a beta never deletes itself.
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          echo "Cleaning up pre-releases superseded by ${VERSION}..."
+          # Delete every same-version pre-release (those starting with "X.Y.Z-", e.g.
+          # X.Y.Z-beta.* / -rc.*), removing both the GitHub Release and its git tag. The stable
+          # Release is already published, so a single delete failure only warns and never fails
+          # the job (idempotent and non-fatal).
+          gh release list --limit 200 --json tagName --jq '.[].tagName' | while read -r TAG; do
+            case "$TAG" in
+              "${VERSION}-"*)
+                echo "Deleting superseded pre-release: ${TAG}"
+                gh release delete "${TAG}" --cleanup-tag --yes || echo "::warning::Failed to delete ${TAG}"
+                ;;
+            esac
+          done

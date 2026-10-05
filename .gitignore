@@ -1,0 +1,70 @@
+# --- .gitignore for the public Obsidian plugin repo ---
+
+# Dependencies
+node_modules/
+
+# pnpm-only project: npm / yarn lockfiles must not be mixed in (they pollute the jest tree)
+package-lock.json
+yarn.lock
+
+# Build artifacts (main.js is attached to the GitHub Release, not tracked in Git)
+main.js
+*.js.map
+dist/
+build/
+
+# Tests
+coverage/
+
+# Environment variables / logs
+.env
+.env.*
+# Keep the committed E2E env template (placeholders only; real values stay gitignored).
+!.env.e2e.example
+*.log
+
+# secretlint local-only denylist (company/personal hostnames etc.; never kept in the public repo)
+.secretlintrc.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.serena/
+
+# --- Development-only files (excluded from the public plugin repository) ---
+refs/
+.specify/
+.claude/
+specs/
+report/
+docs/
+scripts/
+CLAUDE.md
+
+# TypeScript incremental build info
+*.tsbuildinfo
+.env
+
+# Playwright MCP snapshot output
+.playwright-mcp/
+/report/
+
+# wdio-obsidian-service download cache (b-2)
+.obsidian-cache/
+/tmp/
+
+# Project-local MCP config (contains no secret, but kept out of the public repo)
+.mcp.json
+
+# b-3 (Android) diagnostic bundles pulled from the emulator on failure
+.b3-diagnostics/
+/.serena/
+
+# local agent / editor / spec working state — never published
+/.claude/
+/.specify/
+/.vscode/
+/specs/
+/CLAUDE.md
