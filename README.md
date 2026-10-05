@@ -73,6 +73,12 @@ The plugin exposes more of the Versions data already kept by Nextcloud:
   - lazy loading and in-window cache
   - restore directly from the selected version
 - restore from History, Compare and Line History
+- first-class Version History entry points using the same `history` icon:
+  - desktop ribbon
+  - mobile Open menu
+  - command palette / hotkey
+  - command icon that can be pinned to the mobile toolbar
+  - file context menu / mobile long-press menu
 
 Line History is **not Git blame**. It reconstructs provenance only from versions still retained by Nextcloud; pruned intermediate revisions cannot be recovered.
 
@@ -185,7 +191,7 @@ Foreground watch is currently not enabled on iOS.
 
 ## Version History / Version Browser
 
-For a synchronized file, run **Show version history**.
+For a synchronized file, open **Version history** from the ribbon, mobile Open menu, command palette/hotkey, a pinned mobile-toolbar command, or the file context/long-press menu.
 
 From there you can:
 
