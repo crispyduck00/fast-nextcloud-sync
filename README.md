@@ -110,7 +110,46 @@ The vault name is used as the remote vault folder, following the upstream plugin
 
 Install and configure Nextcloud's [notify_push](https://github.com/nextcloud/notify_push) app on the server.
 
-The exact server/reverse-proxy setup depends on your Nextcloud deployment. The push endpoint must be reachable externally and Nextcloud's proxy/trusted-proxy configuration must be correct.
+The official `notify_push` project requires Redis to be configured for Nextcloud. Its recommended quick setup is:
+
+1. Install the **Client Push** (`notify_push`) app from the Nextcloud app store.
+2. Run:
+   ```bash
+   occ notify_push:setup
+   ```
+   and follow the setup wizard.
+3. Make the push server reachable through your reverse proxy, normally below `/push/`.
+4. If doing the final setup manually, enable/configure it with:
+   ```bash
+   occ app:enable notify_push
+   occ notify_push:setup https://cloud.example.com/push
+   ```
+5. Ensure Nextcloud's `trusted_proxies` / forwarded-for configuration is correct. The setup command tests this and reports proxy problems.
+
+Common reverse-proxy examples from the official project:
+
+**nginx**
+
+```nginx
+location ^~ /push/ {
+    proxy_pass http://127.0.0.1:7867/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+**Caddy v2**
+
+```caddy
+handle_path /push/* {
+    reverse_proxy http://127.0.0.1:7867
+}
+```
+
+Exact service/container paths depend on your Nextcloud installation, so use the official `notify_push` README as the authoritative server-side reference.
 
 ### Plugin setup
 
