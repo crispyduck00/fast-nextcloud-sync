@@ -1,6 +1,6 @@
 {
   "name": "fast-nextcloud-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unofficial Obsidian Nextcloud sync fork with Client Push, Android foreground watch and enhanced version history",
   "main": "main.js",
   "packageManager": "pnpm@12.3.4",
