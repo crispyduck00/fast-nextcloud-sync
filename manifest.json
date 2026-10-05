@@ -1,9 +1,10 @@
 {
-  "id": "nextcloud-sync",
-  "name": "Nextcloud Sync",
-  "version": "1.0.8",
+  "id": "fast-nextcloud-sync",
+  "name": "Fast Nextcloud Sync",
+  "version": "0.1.0",
   "minAppVersion": "1.13.0",
-  "description": "Bidirectional sync between your Vault and Nextcloud using hash-based change detection.",
-  "author": "Daisuke ITO",
+  "description": "Unofficial Nextcloud sync fork with Client Push, Android foreground watch, enhanced version history and sync hardening.",
+  "author": "Andreas Nagy",
+  "authorUrl": "https://github.com/crispyduck00",
   "isDesktopOnly": false
 }
