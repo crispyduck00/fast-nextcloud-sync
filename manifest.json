@@ -1,7 +1,7 @@
 {
   "id": "fast-nextcloud-sync",
   "name": "Fast Nextcloud Sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.13.0",
   "description": "Unofficial Nextcloud sync fork with Client Push, Android foreground watch, enhanced version history and sync hardening.",
   "author": "Andreas Nagy",
