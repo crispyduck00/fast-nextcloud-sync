@@ -197,13 +197,22 @@ From there you can:
 
 Nextcloud's built-in **Versions** app must be enabled (it normally is by default).
 
-### Team / Group Folders
+### Restore semantics and Team / Group Folders
 
 Nextcloud Group Folders use different server-side version semantics from ordinary user storage.
 
-In observed testing, restoring a personal-file version can make that historical revision the current file with its old timestamp/author metadata. A Group Folder restore can instead create a new live Current state while keeping the historical source revision separately visible.
+For ordinary user storage, core Nextcloud can restore an old version by moving that retained version back into the live file and preserving the old revision timestamp. The restored source can therefore stop existing as a separate retained version even though its content is now Current.
 
-The plugin deliberately displays the metadata Nextcloud actually exposes rather than inventing restore provenance. For history calculations, **Current is always treated as the final logical state**.
+Group Folders use a different backend and can keep the historical source revision separately while producing a distinct live Current state.
+
+Fast Nextcloud Sync treats **Current as the live state now**, regardless of the timestamp carried by its restored content. When a restored Current has an old revision timestamp and newer pre-restore versions still exist, the UI may show that Current content twice on the timeline:
+
+- once as a non-restorable **Restored source revision** at its historical position
+- once as **Current** at the logical end of the timeline
+
+This is intentional. It preserves the historical position needed for Version Browser and Line History without pretending that Nextcloud still stores a restorable copy when core user-storage restore has consumed it.
+
+Line History always shows only lines present in the selected target state. Later pre-restore versions may help establish history, but their deleted/later-only lines must never appear in restored Current.
 
 ## Multi-user / shared notes
 
