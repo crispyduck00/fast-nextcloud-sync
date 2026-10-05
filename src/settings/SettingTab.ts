@@ -25,9 +25,9 @@ import {
 // login flow, and the handful of rows that draw themselves.
 
 /** Default secret ID in SecretStorage (users can pick a different ID via "Link…"). */
-const DEFAULT_PASSWORD_SECRET_ID = 'fast-nextcloud-sync-password';
+const DEFAULT_PASSWORD_SECRET_ID = 'obsidian-nextcloudsync-password';
 /** Key under which older versions stored the password in localStorage (for migration). */
-const LEGACY_CREDENTIALS_KEY = 'fast-nextcloud-sync-password';
+const LEGACY_CREDENTIALS_KEY = 'obsidian-nextcloudsync-password';
 
 export class NextcloudSyncSettingTab extends PluginSettingTab implements SettingDefinitionsHost {
   private clientPushApplyTimer: number | null = null;
