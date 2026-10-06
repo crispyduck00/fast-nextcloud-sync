@@ -10,6 +10,28 @@ This fork grew from a personal goal: make synchronization feel faster and requir
 
 > Contributors and future development sessions: see [DEVELOPMENT.md](DEVELOPMENT.md) for the branch, integration, promotion, and release workflow.
 
+## Demo
+
+### Fast Desktop ↔ Android synchronization
+
+![Fast Nextcloud Sync demo](https://raw.githubusercontent.com/crispyduck00/obsidian-nextcloudsync/integration/all-topics/docs/assets/fast-nextcloud-sync-demo.gif)
+
+The demo shows a real Windows Obsidian client and Android device synchronizing through Nextcloud with low latency. Client Push is used for remote change notification while the existing synchronization engine remains authoritative for reconciliation, conflict handling, and conservative fallbacks.
+
+The demo also briefly opens the enhanced Nextcloud Version History.
+
+### Compact Android sync status
+
+<img src="https://raw.githubusercontent.com/crispyduck00/obsidian-nextcloudsync/integration/all-topics/docs/assets/mobile-sync-status.png" width="360" alt="Fast Nextcloud Sync compact Android sync status">
+
+The compact mobile status indicator exposes synchronization state and optional Client Push connectivity without requiring a desktop-style status bar.
+
+### Enhanced Nextcloud Version History
+
+![Fast Nextcloud Sync version comparison](https://raw.githubusercontent.com/crispyduck00/obsidian-nextcloudsync/integration/all-topics/docs/assets/version-history-diff.png)
+
+Version History exposes retained Nextcloud revisions directly in Obsidian, including comparison, restore, Version Browser, and retained-version line provenance.
+
 ## Relationship to upstream
 
 Development happens in a separate fork:
