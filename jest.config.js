@@ -1,0 +1,34 @@
+/** @type {import('jest').Config} */
+// Classification "a" (Nextcloud-independent, no UI). This is the DEFAULT `pnpm test`
+// and the only suite that runs in CI: pure logic + the spec-coverage meta-test.
+// The live suites live under tests/b1-nextcloud-headless/ (bash tests/docker/run.sh b1),
+// tests/b2-nextcloud-ui/ (bash tests/docker/run.sh b2), tests/b3-android-ui/ (bash tests/docker/run.sh b3) and
+// tests/b4-plain-webdav/ (bash tests/docker/run.sh b4) and are excluded here.
+module.exports = {
+  preset: 'ts-jest',
+  testEnvironment: 'node',
+  setupFiles: ['<rootDir>/tests/a-no-nextcloud/support/setup.ts'],
+  moduleNameMapper: {
+    '^obsidian$': '<rootDir>/tests/a-no-nextcloud/support/obsidian.ts',
+  },
+  testMatch: ['**/tests/a-no-nextcloud/**/*.test.ts'],
+  // Exclude the live suites from execution and from haste-map scanning
+  // (tests/b1-.../__mocks__ shares the name 'obsidian' with tests/a-.../support).
+  testPathIgnorePatterns: [
+    '/node_modules/',
+    '/tests/b1-nextcloud-headless/',
+    '/tests/b2-nextcloud-ui/',
+    '/tests/b3-android-ui/',
+    '/tests/b4-plain-webdav/',
+  ],
+  modulePathIgnorePatterns: [
+    '<rootDir>/tests/b1-nextcloud-headless/',
+    '<rootDir>/tests/b2-nextcloud-ui/',
+    '<rootDir>/tests/b3-android-ui/',
+    '<rootDir>/tests/b4-plain-webdav/',
+  ],
+  transform: {
+    '^.+\\.tsx?$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
+  },
+  passWithNoTests: true,
+};

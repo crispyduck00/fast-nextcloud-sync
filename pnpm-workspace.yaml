@@ -23,14 +23,14 @@ allowBuilds:
 # Range-scoped where only some versions are vulnerable; unconditional where the whole line is safe to pin.
 # (pnpm reads overrides here, not in package.json.)
 #
-# Re-verified 2026-09-08 (spec 084) by deleting every entry below and re-resolving: three of them still
-# change the answer — serialize-javascript (6.0.2 comes back), js-yaml (3.15.2 and 4.3.2 come back) and
-# @puppeteer/browsers (falls back to 2.13.2). The rest currently resolve at or above their floor on
-# their own and are kept as a ratchet, not because they are doing work today: dropping them would let a
-# later dependency update walk back under an advisory silently, and Dependabot only re-evaluates on
-# main. Two entries were dropped because they had become unappliable rather than merely quiet — `diff`
-# (mocha 12 declares ^9.0.0, so nothing lands in the old >=6 <8.0.3 window) and `ip-address` (gone from
-# the tree entirely).
+# Re-verified 2026-10-25 by deleting every entry below and re-resolving into a scratch directory
+# (no lockfile): 3 entries still change the answer — serialize-javascript (6.0.2 comes back), js-yaml
+# (3.15.2 and 4.3.2 come back) and @puppeteer/browsers (falls back to 2.13.2). 10 entries resolve at or
+# above their floor on their own and are kept as a ratchet, not because they are doing work today:
+# dropping them would let a later dependency update walk back under an advisory silently, and
+# Dependabot only re-evaluates on main (brace-expansion x3, fast-uri, @xmldom/xmldom, browserslist,
+# fast-xml-parser, tar, undici x2). 1 entry was removed: deepmerge-ts, because every wdio package that
+# uses it (@wdio/config, @wdio/runner, @wdio/utils, webdriver) now declares ^8.0.0 itself.
 overrides:
   serialize-javascript@<7.0.5: '>=7.0.5' # GHSA RCE/DoS (<=7.0.2 high, <7.0.5 moderate), via mocha
   # Unconditional (not range-scoped): every transitive dependent already tolerates 4.x/5.x, so pin the
@@ -80,17 +80,9 @@ overrides:
   # Upgrading wdio does not help (9.31.1 still declares @puppeteer/browsers ^2.2.0). @puppeteer/browsers
   # 3.x drops extract-zip entirely (deps are just modern-tar + yargs) and still exports every symbol
   # @wdio/utils calls: Browser, ChromeReleaseChannel, canDownload, computeExecutablePath,
-  # detectBrowserPlatform, install, resolveBuildId. The second major-crossing override here, and the
-  # safest of the three: instrumenting the module's entry point during a full b-2 run showed it is
+  # detectBrowserPlatform, install, resolveBuildId. The safest kind of
+  # major-crossing override: instrumenting the module's entry point during a full b-2 run showed it is
   # never loaded at all, because wdio-obsidian-service downloads and manages its own
   # electron-chromedriver instead of going through @wdio/utils' startWebDriver. So this only prunes a
   # vulnerable package out of the tree; it changes no code path we actually execute.
   '@puppeteer/browsers@>=2.0.0 <3.0.0': '>=3.0.0 <4.0.0' # @wdio/utils declares ^2.2.0
-  # GHSA stack exhaustion when merging recursive object graphs (<8.0.0). Every wdio package declares
-  # ^7.0.3, so this is the third major-crossing override. 8.0.0 renamed the mergeInfo system and
-  # "aligned shorthand", which is exactly what webdriver's only call site uses
-  # (`deepmergeCustom({ mergeArrays: false })` in its utils), so both that call and plain `deepmerge`
-  # were run side by side on 7.1.5 and 8.0.1: identical output on nested records and arrays. b-2
-  # exercises this for real — unlike @puppeteer/browsers, which wdio-obsidian-service never loads
-  # because it manages its own electron-chromedriver (verified by instrumenting the module).
-  'deepmerge-ts@<8.0.0': '>=8.0.0 <9.0.0' # wdio declares ^7.0.3

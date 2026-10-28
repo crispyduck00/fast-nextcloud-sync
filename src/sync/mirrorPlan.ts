@@ -1,140 +1,120 @@
 import { RemoteDirInfo, RemoteFileInfo } from '../types';
 
-/**
- * Pull mirror (feature 045): pure classification of what a "mirror this device from the remote"
- * operation must download and delete, given an authoritative remote listing and the local state.
- *
- * Extracted as a pure function (like `massDeleteLimit`) so the mirror contract is unit-testable in
- * the a-layer without a live server. The SyncEngine wraps this with real I/O (getFiles/download/
- * trashFile) and StateDB reconciliation.
- *
- * Safety: this operation intentionally bypasses the mass-delete breaker's COUNT limit (the user
- * explicitly declared the remote authoritative). The remaining guard is listing completeness:
- * when the remote listing could not be fully obtained, `ok` is false and every list is empty, so
- * the caller performs zero deletions (spec 045 FR-009 / SC-005).
- */
+// Pure planning for the pull mirror, kept free of I/O so it is unit-testable (docs/spec.md §14).
+// Mirror bypasses the mass-delete count limit; the remaining guard is listing completeness: when the
+// listing is incomplete `ok` is false and every list is empty, so nothing is deleted.
 
-/** One local file the mirror can see: its vault-relative path and current content hash. */
 export interface LocalFileEntry {
   path: string;
   hash: string;
+  // Local stat at plan time; apply refuses to mark a skipped file converged when it has changed since.
+  size: number;
+  mtime: number;
 }
 
-/** The mirror plan: what to download, what to delete, and how many were already in sync. */
+export interface SkippedFile {
+  path: string;
+  size: number;
+  mtime: number;
+}
+
 export interface MirrorPlan {
-  /** True iff the authoritative remote listing was obtained completely. False ⇒ do nothing. */
   ok: boolean;
-  /** Reason when `ok` is false (surfaced to the user); null when ok. */
   reason: string | null;
-  /** Remote files to download (missing locally or content differs). */
   downloads: RemoteFileInfo[];
-  /** Local-only files to delete (present locally, absent from the remote listing). */
   deleteFiles: string[];
-  /** Remote-only folders to create locally (empty folders included), sorted parent→child. */
-  createDirs: RemoteDirInfo[];
-  /** Local-only folders to delete (empty folders included), sorted child→parent. */
   deleteDirs: string[];
-  /** Count of remote files already identical locally (skipped, no transfer). */
   skipCount: number;
-  /** The authoritative remote file listing (kept for apply + StateDB reconciliation). */
   remoteFiles: RemoteFileInfo[];
-  /** The authoritative remote directory listing, including empty collections. */
+  skipped: SkippedFile[];
+  // Non-excluded remote folders, paths without a trailing slash.
   remoteDirs: RemoteDirInfo[];
+  // Remote folders missing locally, shallowest first.
+  createDirs: string[];
 }
 
-/** The outcome of applying a mirror plan. */
 export interface MirrorResult {
   downloaded: number;
   deleted: number;
   skipped: number;
+  createdDirs: number;
   errors: Array<{ path: string; message: string }>;
+  /** Sorted IDs of enabled plugins whose code was written locally by the mirror; they need a restart. */
+  pluginsNeedingRestart: string[];
 }
 
-/**
- * Number of path segments — deeper paths have more. Used to sort folder deletions child→parent
- * so a parent is never removed before its children.
- */
 function depth(path: string): number {
   return path.split('/').length;
 }
 
-/**
- * Build a {@link MirrorPlan} from an authoritative remote listing and the local state.
- *
- * @param remoteFiles  the COMPLETE remote file listing (from a real PROPFIND, no short-circuit)
- * @param remoteDirs   the COMPLETE remote directory listing (empty collections included)
- * @param localFiles   every local file the mirror may touch (path + content hash)
- * @param localDirs    every local folder the mirror may touch (vault-relative paths)
- * @param isExcluded   predicate for system/user exclusions (isSystemExcluded ∪ excluded folders)
- * @param listingOk    whether the remote listing was obtained completely (false ⇒ abort gate)
- * @param reason       optional reason to attach when listingOk is false
- */
 export function buildMirrorPlan(
   remoteFiles: RemoteFileInfo[],
-  remoteDirs: RemoteDirInfo[],
   localFiles: LocalFileEntry[],
   localDirs: string[],
   isExcluded: (path: string) => boolean,
   listingOk: boolean,
   reason: string | null = null,
+  remoteDirs: RemoteDirInfo[] = [],
 ): MirrorPlan {
-  // Abort gate: an incomplete/failed listing must never drive deletions.
+  // An incomplete listing must never drive deletions.
   if (!listingOk) {
     return {
       ok: false,
       reason: reason ?? 'Remote listing could not be obtained; mirror aborted (no changes made).',
       downloads: [],
       deleteFiles: [],
-      createDirs: [],
       deleteDirs: [],
       skipCount: 0,
       remoteFiles: [],
+      skipped: [],
       remoteDirs: [],
+      createDirs: [],
     };
   }
 
   const remoteEligible = remoteFiles.filter((r) => !isExcluded(r.path));
-  const remoteDirsEligible = remoteDirs.filter((r) => !isExcluded(r.path));
   const remoteSet = new Set(remoteEligible.map((r) => r.path));
-  const remoteDirSet = new Set(remoteDirsEligible.map((r) => r.path.replace(/\/+$/, '')));
-  const localHashByPath = new Map(localFiles.map((f) => [f.path, f.hash]));
+  const localByPath = new Map(localFiles.map((f) => [f.path, f]));
 
   const downloads: RemoteFileInfo[] = [];
-  let skipCount = 0;
+  const skipped: SkippedFile[] = [];
   for (const r of remoteEligible) {
-    const localHash = localHashByPath.get(r.path);
-    // Skip only when we can PROVE the content already matches: a server-computed checksum that
-    // equals the local hash. Missing locally, unknown checksum, or mismatch ⇒ download (safe side:
-    // the vault ends up matching the remote regardless).
-    if (localHash != null && r.checksum != null && r.checksum === localHash) {
-      skipCount++;
+    const local = localByPath.get(r.path);
+    // Skip only when a server checksum proves the content matches; anything else downloads (safe side).
+    if (local != null && r.checksum != null && r.checksum === local.hash) {
+      skipped.push({ path: r.path, size: local.size, mtime: local.mtime });
     } else {
       downloads.push(r);
     }
   }
 
-  // Local-only files (present locally, not on the remote) → delete. Excluded paths are untouched.
   const deleteFiles = localFiles
     .map((f) => f.path)
     .filter((p) => !isExcluded(p) && !remoteSet.has(p));
 
-  const localDirSet = new Set(localDirs.map((d) => d.replace(/\/+$/, '')));
+  // A folder is kept iff some remote file lives under it.
+  const remoteDirPrefixes = remoteEligible.map((r) => r.path);
+  // Trailing slashes are stripped so folder paths compare equal to localDirs entries.
+  const outRemoteDirs = remoteDirs
+    .map((d) => ({ ...d, path: d.path.replace(/\/+$/, '') }))
+    .filter((d) => d.path !== '' && !isExcluded(d.path));
+  const remoteDirSet = new Set(outRemoteDirs.map((d) => d.path));
+  const localDirSet = new Set(localDirs);
 
-  // Remote-only folders → create locally. Remote directories are first-class: an empty collection
-  // has no descendant file to reveal its existence, so file paths alone can never mirror it.
-  const createDirs = remoteDirsEligible
-    .filter((d) => d.path && !localDirSet.has(d.path.replace(/\/+$/, '')))
-    .sort((a, b) => depth(a.path) - depth(b.path));
+  const createDirs = outRemoteDirs
+    .map((d) => d.path)
+    .filter((p) => !localDirSet.has(p))
+    // Shallowest first so a parent exists before its children; ties in plain string order.
+    .sort((a, b) => depth(a) - depth(b) || (a < b ? -1 : a > b ? 1 : 0));
 
-  // Local-only folders → delete. Preserve a directory when the authoritative directory listing
-  // contains it, OR as a conservative fallback when a remote file lives below it.
-  const remoteFilePrefixes = remoteEligible.map((r) => r.path);
   const deleteDirs = localDirs
-    .map((d) => d.replace(/\/+$/, ''))
-    .filter((d) => !isExcluded(d)
-      && !remoteDirSet.has(d)
-      && !remoteFilePrefixes.some((rp) => rp === d || rp.startsWith(d + '/')))
-    // child→parent so a parent folder is never removed before its children
+    .filter(
+      (d) =>
+        !isExcluded(d) &&
+        !remoteDirSet.has(d) &&
+        !remoteDirPrefixes.some((rp) => rp === d || rp.startsWith(d + '/')),
+    )
+    // Deepest first, so a parent is never removed before its children.
     .sort((a, b) => depth(b) - depth(a));
 
   return {
@@ -142,10 +122,11 @@ export function buildMirrorPlan(
     reason: null,
     downloads,
     deleteFiles,
-    createDirs,
     deleteDirs,
-    skipCount,
+    skipCount: skipped.length,
     remoteFiles,
-    remoteDirs: remoteDirsEligible,
+    skipped,
+    remoteDirs: outRemoteDirs,
+    createDirs,
   };
 }

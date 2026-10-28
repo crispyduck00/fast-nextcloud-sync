@@ -1,8 +1,7 @@
 import { SyncStatus } from '../types';
 
-/** Status-bar surface used by the sync engine. Implemented by StatusBarItem and NullStatusBar. */
 export interface IStatusBar {
-  setStatus(status: SyncStatus): void;
+  setStatus(status: SyncStatus, opts?: { automatic?: boolean }): void;
   setProgress(processed: number, total: number): void;
   setConflictCount(count: number): void;
   setErrorCount(count: number): void;
@@ -37,7 +36,6 @@ export class StatusBarItem implements IStatusBar {
     this.render();
   }
 
-  /** Show per-file progress during sync: "🔄 12/150" */
   setProgress(processed: number, total: number): void {
     this.status = 'syncing';
     this.progressText = `${processed}/${total}`;

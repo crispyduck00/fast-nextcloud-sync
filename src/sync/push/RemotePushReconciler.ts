@@ -3,7 +3,7 @@ import type { DirState } from '../../types';
 import type { FileLogger } from '../../util/FileLogger';
 import type { RemoteFileReconcileResult } from '../watch/WatchOperations';
 
-export type RemoteBatchReconcileResult = 'done' | 'deferred' | 'untracked' | 'busy' | 'full-sync';
+export type RemoteBatchReconcileResult = 'done' | 'deferred' | 'plugin-pending' | 'untracked' | 'busy' | 'full-sync';
 
 export interface RemotePushBatch {
   fileIds: readonly string[];
@@ -14,6 +14,7 @@ export interface RemotePushBatch {
 export interface RemotePushReconcilerDeps {
   stateDB: Pick<StateDB, 'getFileByRemoteId' | 'getAllDirs'>;
   isFullSyncRunning(): boolean;
+  isPluginPath?(path: string): boolean;
   reconcileFile(path: string, expectedRemoteFileId: string): Promise<RemoteFileReconcileResult>;
   logger?: Pick<FileLogger, 'log'>;
 }
@@ -130,10 +131,16 @@ export class RemotePushReconciler {
     }
 
     let sawDeferred = false;
+    let sawPlugin = false;
     for (const item of work) {
+      if (this.deps.isPluginPath?.(item.path)) {
+        sawPlugin = true;
+        continue;
+      }
       if (this.deps.isFullSyncRunning()) return 'busy';
       const result = await this.deps.reconcileFile(item.path, item.fileId);
       if (result === 'done') continue;
+      if (result === 'plugin-pending') { sawPlugin = true; continue; }
       if (result === 'deferred') {
         // A lock/retry on one file must not silently postpone unrelated known files from the same
         // push batch. Preserve the unresolved outcome, but continue with the remaining independent
@@ -144,7 +151,7 @@ export class RemotePushReconciler {
       return result;
     }
 
-    return sawDeferred ? 'deferred' : 'done';
+    return sawDeferred ? 'deferred' : sawPlugin ? 'plugin-pending' : 'done';
   }
 
   private directoryIndex(): Map<string, DirState> | null {

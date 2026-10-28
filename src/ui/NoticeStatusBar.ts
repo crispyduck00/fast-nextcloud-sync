@@ -6,30 +6,27 @@ import { IStatusBar } from './StatusBarItem';
 const DISMISS_SUCCESS_MS = 4000;
 const DISMISS_PROBLEM_MS = 10000;
 
-/**
- * Mobile implementation of {@link IStatusBar}. Obsidian has no visible status bar on mobile
- * (`addStatusBarItem` is unavailable there), so sync feedback is surfaced as a single, reused
- * `Notice` toast: persistent (`timeout = 0`) while syncing, then updated in place to a result
- * summary that auto-dismisses. This keeps the sync engine free of platform branching — it just
- * drives the IStatusBar port, and the mobile wiring swaps this in for NullStatusBar.
- *
- * Single-toast invariant: at most one Notice is ever live; progress updates reuse it via
- * `setMessage`, and a new sync reclaims a still-visible completion toast instead of stacking.
- */
+// Mobile has no status bar (addStatusBarItem is unavailable), so feedback is one reused Notice:
+// persistent while syncing, then updated in place to an auto-dismissing summary.
+// Invariant: at most one Notice is live; a new sync reclaims a still-visible completion toast.
 export class NoticeStatusBar implements IStatusBar {
   private notice: Notice | null = null;
   private conflictCount = 0;
   private errorCount = 0;
   private dismissTimer: number | null = null;
+  // True while an automatic sync has not yet shown a toast; it stays silent unless there is news.
+  private quiet = false;
 
-  setStatus(status: SyncStatus): void {
+  setStatus(status: SyncStatus, opts?: { automatic?: boolean }): void {
     if (status !== 'syncing') return; // idle/error/conflict alone never pops a toast; completion drives the result
+    this.quiet = opts?.automatic === true;
+    if (this.quiet) return;
     this.clearDismiss();
     this.ensureNotice('🔄 Syncing…');
   }
 
-  /** Show per-file progress, reusing the single toast: "🔄 12/150". */
   setProgress(processed: number, total: number): void {
+    this.quiet = false;
     this.clearDismiss();
     this.ensureNotice('🔄 Syncing…');
     this.notice?.setMessage(`🔄 ${processed}/${total}`);
@@ -46,6 +43,12 @@ export class NoticeStatusBar implements IStatusBar {
   setSyncComplete(uploadedCount: number, downloadedCount: number, conflictCount: number, errorCount: number): void {
     this.conflictCount = conflictCount;
     this.errorCount = errorCount;
+    const hasNews = uploadedCount + downloadedCount > 0 || conflictCount > 0 || errorCount > 0;
+    if (this.quiet && !hasNews) {
+      this.quiet = false;
+      return;
+    }
+    this.quiet = false;
     this.clearDismiss();
     this.ensureNotice('🔄 Syncing…'); // defensive: surface a result even if setStatus('syncing') was skipped
 
@@ -68,7 +71,6 @@ export class NoticeStatusBar implements IStatusBar {
     return { text: `🟢 Synced ${tail}`, dismissMs: DISMISS_SUCCESS_MS };
   }
 
-  /** Create the persistent toast if absent, otherwise reuse it (single-toast invariant). */
   private ensureNotice(initialText: string): void {
     if (!this.notice) this.notice = new Notice(initialText, 0);
   }
@@ -81,7 +83,6 @@ export class NoticeStatusBar implements IStatusBar {
   }
 }
 
-/** "1 error" / "2 errors" — simple English pluralization. */
 function count(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }

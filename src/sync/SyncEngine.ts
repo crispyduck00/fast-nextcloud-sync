@@ -1,4 +1,6 @@
-import { App, Notice, Platform } from 'obsidian';
+import { App, Notice, Platform, apiVersion } from 'obsidian';
+import { CreationTimeAligner } from './ctime/CreationTimeAligner';
+import { uploadCreationTimeMs } from '../util/creationTime';
 import {
   DavSyncSettings,
   FileState,
@@ -36,6 +38,7 @@ import { TransferService } from './transfer/TransferService';
 import { VersionService, VersionComparison } from './versions/VersionService';
 import { LineHistoryResult } from './versions/lineHistory';
 import { remoteIdOf } from './remoteIdentity';
+import { checksumProvesIdentical, convergedState } from './identity/contentIdentity';
 import { DeletionService } from './deletion/DeletionService';
 import { ResolutionService } from './resolution/ResolutionService';
 import { ConflictApplier } from './conflict/ConflictApplier';
@@ -52,6 +55,12 @@ import { WebDAVFactory } from '../network/WebDAVFactory';
 import { IWebDAVClient } from '../network/IWebDAVClient';
 import { RenameTracker } from './RenameTracker';
 import { ConfigSyncResolver } from './ConfigSyncResolver';
+import { PluginSyncCoordinator } from './plugins/PluginSyncCoordinator';
+import { partitionPluginManifestsLast, pluginDirPath } from './plugins/pluginPaths';
+import { fileSameContent } from './plugins/bundleDirection';
+import { collectCommunityPluginCandidates, type PluginCandidateList } from './plugins/candidates';
+import { computeSyncScopeFingerprint } from './plugins/scopeFingerprint';
+import { dropSubtreeTracking } from './deletion/subtreeTracking';
 import { sha256 } from '../util/hash';
 import { FIXED, chunkThresholdMB } from '../util/fixedSyncConfig';
 import { FileLogger } from '../util/FileLogger';
@@ -65,13 +74,11 @@ import { IUploadStrategy } from './upload/IUploadStrategy';
 import { SimpleUploadStrategy } from './upload/SimpleUploadStrategy';
 import { ChunkedUploadStrategy } from './upload/ChunkedUploadStrategy';
 
-/** The categorized first-sync plan produced by buildInitialPlan and consumed by executePlan. */
 interface InitialSyncPlan {
   uploads: string[];
   downloads: string[];
   conflicts: string[];
   deletes: string[];
-  /** Files present and identical on both sides (no transfer needed; state is seeded). */
   unchanged: string[];
 }
 
@@ -80,54 +87,28 @@ interface SyncEngineOptions {
   settings: DavSyncSettings;
   localAdapter: LocalAdapter;
   stateDB: StateDB;
-  /** Last-synced bodies used as the 3-way merge base (feature 038). Optional (absent in some tests). */
   baseStore?: MergeBaseStore;
-  /**
-   * Captured clean sides of marker-conflicted notes, so force-resolution recovers a real clean
-   * version rather than the marker content (feature 044). Optional (absent in some tests).
-   */
+  // Clean sides of marker-conflicted notes, so force-resolution restores real content instead of markers (docs/spec.md §6.4).
   cleanSideStore?: CleanSideStore;
   statusBar: IStatusBar;
-  /**
-   * Optional status surface for lightweight single-path operations (local Watch and targeted
-   * Client Push). Desktop normally reuses statusBar; mobile can inject a NullStatusBar so frequent
-   * automatic path work stays silent while authoritative full/manual sync keeps its normal feedback.
-   */
+  /** Optional status surface for lightweight watch operations. */
   lightweightStatusBar?: IStatusBar;
   /** Persisted per-file sync-history log for the status dialog. Optional (absent in some tests). */
   historyStore?: SyncHistoryStore;
   webdavFactory: WebDAVFactory;
   pluginDir: string;
-  /** Obsidian's configuration folder (Vault#configDir), e.g. `.obsidian`. User-configurable. */
   configDir: string;
-  /**
-   * Returns true when `path` is one of this device's per-device log files that is currently being
-   * written (its toggle is on), so it must be kept out of sync. Optional (absent in some tests);
-   * when omitted, no log-based exclusion is applied. Host owns the host-token/settings details
-   * (see `isActiveOwnLog`) to keep SyncEngine decoupled from log-path resolution.
-   */
+  // Host-owned predicate for this device's active log files, which must stay out of sync (docs/spec.md §9.1).
   isActiveLogFile?: (path: string) => boolean;
-  /**
-   * Returns true while `path` is being actively edited — the user has typed into it within the
-   * watch debounce window and the editor may still be ahead of what is on disk.
-   *
-   * Consulted before any REMOTE -> LOCAL write (download, conflict resolution). Writing under the
-   * cursor is how a resolution turns into the user watching their sentence disappear (GitHub issue
-   * #42), and no merge is good enough to make that acceptable. Uploads are unaffected: they read
-   * the file and leave it alone.
-   *
-   * Optional (absent in some tests); when omitted nothing is deferred. The host owns the definition
-   * because only it sees the vault's modify events.
-   */
+  // True while the user is typing into `path`. Consulted before any REMOTE -> LOCAL write, because writing under the cursor
+  // discards edits; uploads are unaffected (docs/spec.md §5.7b).
   isBeingEdited?: (path: string) => boolean;
-  /** Diagnostic logger (writes nextcloud-sync-debug.md while Debug mode is on). Optional. */
   logger?: FileLogger;
-  /**
-   * Invoked once per established connection with the detected server features.
-   * Lets the host persist the server version (for the settings recommendation banner)
-   * without coupling the sync engine to plugin settings persistence.
-   */
+  // Lets the host persist the server version without coupling the engine to settings persistence.
   onFeatures?: (features: NextcloudFeatures) => void;
+  // Plugin ids whose code was written and that still need an Obsidian restart. Shared with the host so it
+  // outlives engine re-creation; a fresh set when omitted.
+  pluginsAwaitingRestart?: Set<string>;
 }
 
 export class SyncEngine {
@@ -137,89 +118,79 @@ export class SyncEngine {
   private client: IWebDAVClient | null = null;
   private features: NextcloudFeatures | null = null;
   private uploadStrategy: IUploadStrategy | null = null;
-  /** Balking pattern: sync-in-progress flag — a second syncManual() call returns immediately. */
+  // Balking flag: a second syncManual() call returns immediately.
   private running = false;
-  /**
-   * Two-Phase Termination: set by requestStop() (e.g. plugin onunload). Bounded-parallel workers
-   * check it and stop pulling new work, so an in-progress sync winds down cleanly instead of firing
-   * more network calls after teardown — important on mobile where the OS may suspend/kill the app.
-   * The sync's finally block (state save) still runs, so no partial-progress state is lost.
-   */
+  // Set by requestStop(): workers stop pulling new work, while the run's finally block still saves state.
   private cancelled = false;
-  /**
-   * The in-flight full-sync run promise (the body of {@link syncManual}), or null when idle. Lets
-   * {@link abortAndWait} await a running sync's clean wind-down (including its finally state save)
-   * before a maintenance reset clears the tracking index, so the two never interleave.
-   */
+  // Lets abortAndWait() await a running sync's wind-down (including its final state save) before a reset.
   private currentRun: Promise<boolean> | null = null;
-  /** Start time of the in-progress full sync (= summary.startedAt); null outside a full sync run. */
-  /** Session-scoped recording (feature 074). Owns the run start time that groups history entries. */
   private readonly journal: SyncJournal;
 
-  /** Merge-base eligibility and save-request pairing (feature 074). */
   private readonly mergeBase: MergeBaseRecorder;
-  /** Currently held lock tokens (path → token). */
-  /** Single-file transfer, locking and size guards (feature 074). Owns the locks it holds. */
+  // One aligner shared by transfer, resolution and conflicts (docs/spec.md §9.7).
+  private readonly creationTime: CreationTimeAligner;
   private readonly transfer: TransferService;
 
-  /** Nextcloud version history (feature 074). Takes no part in a sync session. */
   private readonly versions: VersionService;
 
-  /** Deletion propagation, both directions (feature 074). */
   private readonly deletion: DeletionService;
 
-  /** Compare, force-resolution and the clean-side snapshots (feature 074). */
   private readonly resolution: ResolutionService;
 
-  /** Carries out what ConflictResolver decides (feature 074). */
   private readonly conflicts: ConflictApplier;
 
-  /** Directory three-way reconcile and its mass-delete breaker (feature 074). */
   private readonly directories: DirectoryReconciler;
 
-  /** Watch-mode single-path operations (feature 074). Owns its in-flight and deferred sets. */
   private readonly watch: WatchOperations;
   /** Shared/exclusive gate: lightweight path operations may overlap each other, never a full sync. */
   private readonly activityGate = new SyncActivityGate();
   /** Resolves notify_push IDs and delegates only safe known-file work to the existing classifier. */
   private readonly remotePush: RemotePushReconciler;
 
-  /** Mirror from remote: plan, then apply (feature 074). */
   private readonly mirror: MirrorService;
-  /** Progress counters updated during a sync run (reset each run). */
   private syncProgress = { processed: 0, total: 0 };
-  /**
-   * Feature 064 (C-6): monotonic count of handleConflict entries. Only ever read as a DELTA around a
-   * single watch-mode operation, to answer "did this touch a conflict at all?". The summary counters
-   * cannot answer that: a conflict settled by a deterministic strategy (local-win / remote-win /
-   * biggest-size / latest-mtime) lands in uploadedCount/downloadedCount, indistinguishable from a
-   * routine transfer — yet that is precisely the outcome where one side's content was discarded and
-   * the user most needs to hear about it.
-   */
+  // Monotonic; read as a delta around one watch operation to learn whether it touched a conflict.
+  // Summary counters cannot say: conflicts settled by a deterministic strategy count as plain uploads/downloads.
   private conflictEncounters = 0;
   private renameTracker: RenameTracker | null = null;
-  /**
-   * Decides which `.obsidian` config-folder paths sync (category-level opt-in, issue #1) and
-   * enumerates them for the local scan. Single source of truth shared by `isSystemExcluded`,
-   * the remote-file filter, and the remote-deletion scope guard.
-   */
+  // Single source of truth for which config-folder paths sync (shared by isSystemExcluded, the remote filter
+  // and the remote-deletion scope guard).
   private readonly configSync: ConfigSyncResolver;
 
-  /** Local enumeration (feature 074). Built here because every dependency it needs is stable. */
+  private readonly pluginsAwaitingRestart: Set<string>;
+  // This plugin's own folder name, derived from `pluginDir` so there is a single source for it.
+  private readonly ownPluginId: string;
+  private readonly plugins: PluginSyncCoordinator;
+
   private readonly localScanner: LocalScanner;
 
-  /**
-   * Remote enumeration (feature 074). `isNextcloud` and `networkConcurrency` are passed as accessors,
-   * not values, because capabilities arrive later (ensureClient) and settings can change under us.
-   */
+  // Accessors, not values: capabilities arrive later (ensureClient) and settings can change.
   private readonly remoteListing: RemoteListingSource;
 
   constructor(private readonly opts: SyncEngineOptions) {
+    this.pluginsAwaitingRestart = opts.pluginsAwaitingRestart ?? new Set();
+    // Tolerates a bare engine built without a plugin folder (some suites construct one with only the fields they use).
+    const pluginDir: string = opts.pluginDir ?? '';
+    this.ownPluginId = pluginDir.slice(pluginDir.lastIndexOf('/') + 1);
+    this.plugins = new PluginSyncCoordinator({
+      configDir: opts.configDir,
+      ownId: this.ownPluginId,
+      settings: opts.settings,
+      localAdapter: opts.localAdapter,
+      stateDB: opts.stateDB,
+      awaitingRestart: this.pluginsAwaitingRestart,
+      obsidianVersion: apiVersion,
+      isMobile: () => Platform.isMobile,
+      now: () => Date.now(),
+      notify: (m, t) => { new Notice(m, t); },
+      logger: opts.logger,
+    });
     this.configSync = new ConfigSyncResolver({
       configDir: opts.configDir,
       settings: opts.settings,
       pluginDir: opts.pluginDir,
       localAdapter: opts.localAdapter,
+      pluginGate: this.plugins,
     });
     this.localScanner = new LocalScanner({
       localAdapter: opts.localAdapter,
@@ -231,16 +202,24 @@ export class SyncEngine {
     this.mergeBase = new MergeBaseRecorder({
       baseStore: opts.baseStore,
       autoMergeFileTypes: () => this.opts.settings.autoMergeFileTypes,
+      isPluginPath: (p) => this.plugins.isPluginPath(p),
     });
-    this.transfer = new TransferService({
+    this.creationTime = new CreationTimeAligner({
       localAdapter: opts.localAdapter,
       stateDB: opts.stateDB,
+      isBeingEdited: (p) => this.opts.isBeingEdited?.(p) ?? false,
+      logger: opts.logger,
+    });
+    this.transfer = new TransferService({
+      creationTime: this.creationTime,
+      localAdapter: opts.localAdapter,
+      stateDB: opts.stateDB,
+      localWrite: this.plugins,
       journal: this.journal,
       mergeBase: this.mergeBase,
       maxFileSizeMB: () => this.opts.settings.maxFileSizeMB,
       hasFilesLocking: () => this.features?.hasFilesLocking === true,
-      // Feature 080: which client is connected, not what the server said about itself. Only
-      // NextcloudClient ever fills in `checksum`; StandardWebDAVClient returns null for every file.
+      // Keyed on the connected client, not the server's self-report: only NextcloudClient fills in `checksum`.
       clientReportsChecksums: () => this.features?.isNextcloud === true,
       queueRetry: (p) => { this.retryQueue.push(p); },
       logger: opts.logger,
@@ -248,6 +227,8 @@ export class SyncEngine {
     this.versions = new VersionService({
       localAdapter: opts.localAdapter,
       stateDB: opts.stateDB,
+      mergeBase: this.mergeBase,
+      flushMergeBase: () => this.opts.baseStore?.flush() ?? Promise.resolve(),
       // Markdown is always a mergeable text type in the sync engine even though `md` is
       // intentionally not stored in autoMergeFileTypes. Version compare/line history must mirror
       // that same policy: Markdown + every user-configured Auto Merge File type.
@@ -266,10 +247,12 @@ export class SyncEngine {
       logger: opts.logger,
     });
     this.resolution = new ResolutionService({
+      creationTime: this.creationTime,
       localAdapter: opts.localAdapter,
       stateDB: opts.stateDB,
       historyStore: opts.historyStore,
       cleanSideStore: opts.cleanSideStore,
+      localWrite: this.plugins,
       journal: this.journal,
       mergeBase: this.mergeBase,
       transfer: this.transfer,
@@ -278,6 +261,7 @@ export class SyncEngine {
       logger: opts.logger,
     });
     this.conflicts = new ConflictApplier({
+      creationTime: this.creationTime,
       app: opts.app,
       localAdapter: opts.localAdapter,
       stateDB: opts.stateDB,
@@ -286,6 +270,8 @@ export class SyncEngine {
       mergeBase: this.mergeBase,
       transfer: this.transfer,
       resolution: this.resolution,
+      localWrite: this.plugins,
+      pluginConflictRule: (p) => this.plugins.conflictRuleFor(p),
       resolverConfig: () => ({
         autoMergeFileTypes: this.opts.settings.autoMergeFileTypes,
         autoMergeFileStrategy: this.opts.settings.autoMergeFileStrategy,
@@ -323,8 +309,10 @@ export class SyncEngine {
       deletion: this.deletion,
       resolution: this.resolution,
       isSystemExcluded: (p) => this.isSystemExcluded(p),
+      isPluginPath: (p) => this.plugins.isPluginPath(p),
       connect: () => this.connection(),
       renameTracker: () => this.getOrCreateRenameTracker(),
+      isBlockedByWifiOnly: () => this.isBlockedByWifiOnly(),
       isSyncRunning: () => this.isSyncRunning(),
       runNonFullSyncOperation: (fn) => this.activityGate.runShared(fn),
       processFile: (remote, summary) => this.processFileWithRetry(remote, summary),
@@ -334,6 +322,7 @@ export class SyncEngine {
       logger: opts.logger,
     });
     this.remotePush = new RemotePushReconciler({
+      isPluginPath: (p) => this.plugins.isPluginPath(p),
       stateDB: opts.stateDB,
       isFullSyncRunning: () => this.isSyncRunning(),
       reconcileFile: (path, expectedRemoteFileId) => this.watch.reconcileRemoteFile(path, expectedRemoteFileId),
@@ -352,6 +341,7 @@ export class SyncEngine {
       statusBar: opts.statusBar,
       journal: this.journal,
       mergeBase: this.mergeBase,
+      plugins: this.plugins,
       transfer: this.transfer,
       deletion: this.deletion,
       localScanner: this.localScanner,
@@ -362,6 +352,11 @@ export class SyncEngine {
       },
       enumerateIncludedConfigPaths: () => this.configSync.enumerateIncludedPaths(),
       isSystemExcluded: (p) => this.isSystemExcluded(p),
+      persist: async () => {
+        await opts.stateDB.save();
+        await opts.baseStore?.flush();
+        await opts.historyStore?.save();
+      },
       connect: async () => (await this.ensureClient()).client,
       logger: opts.logger,
     });
@@ -374,19 +369,35 @@ export class SyncEngine {
     return this.renameTracker;
   }
 
-  /**
-   * Initialize the WebDAV client, capabilities, and upload strategy exactly once.
-   * Inspects capabilities to decide whether extensions like chunked/lock are available (Progressive Enhancement).
-   */
+  /** Lists community plugins on this device and (when reachable) the server for the picker. */
+  async listCommunityPluginCandidates(): Promise<PluginCandidateList> {
+    let client: IWebDAVClient | null;
+    try {
+      await this.ensureClient();
+      client = this.client;
+    } catch (err) {
+      void this.opts.logger?.log(`plugins: server unavailable for candidate listing — ${(err as Error).message}`);
+      client = null;
+    }
+    return collectCommunityPluginCandidates({
+      localAdapter: this.opts.localAdapter,
+      client,
+      configDir: this.opts.configDir,
+      ownId: this.ownPluginId,
+      isMobile: Platform.isMobile,
+      logger: this.opts.logger,
+    });
+  }
+
   private async ensureClient(): Promise<{ client: IWebDAVClient; features: NextcloudFeatures }> {
     if (!this.client || !this.features) {
       const { client, features } = await this.opts.webdavFactory.createClient();
       this.client = client;
       this.features = features;
-      // Feature 033: chunked upload is always on (still gated by server capability), and the chunk
-      // threshold is platform-derived (no user input). Both come from the fixed config, not settings.
+      // Chunked upload needs the account-only uploads namespace, which a public link share lacks (docs/spec.md §3);
+      // the threshold is platform-derived (docs/spec.md §15.1.2).
       const uploadConfig = { maxFileSizeMB: this.opts.settings.maxFileSizeMB, uploadChunkThresholdMB: chunkThresholdMB(Platform.isMobile) };
-      this.uploadStrategy = (FIXED.chunkedUploadEnabled && features.isNextcloud)
+      this.uploadStrategy = (FIXED.chunkedUploadEnabled && features.isNextcloud && features.hasAccountDav)
         ? new ChunkedUploadStrategy(uploadConfig)
         : new SimpleUploadStrategy(uploadConfig);
       this.opts.onFeatures?.(features);
@@ -394,34 +405,22 @@ export class SyncEngine {
     return { client: this.client, features: this.features };
   }
 
-  /**
-   * "Wi-Fi only" gate. Skips when enabled and on a cellular connection.
-   * Network type is only detectable on Chromium (desktop / Android); iOS (WebKit) has no
-   * `navigator.connection`, so the setting is ignored there (and its toggle is disabled).
-   */
+  // navigator.connection.type exists only on Chromium/Android: desktop leaves it undefined (never blocks)
+  // and iOS has no navigator.connection (the setting is ignored there).
   private isBlockedByWifiOnly(): boolean {
     const conn = (navigator as Navigator & { connection?: { type?: string } }).connection;
     return isCellularBlocked(this.opts.settings.syncOnWifiOnly, Platform.isIosApp, conn?.type);
   }
 
-  /**
-   * Whether a new watch operation may use the current network.
-   *
-   * This is intentionally only a policy probe: it performs no network request and does not cancel
-   * work that already started. Mobile foreground-watch uses it before every new operation so the
-   * existing Wi-Fi-only setting applies to watch mode as well as full sync / Client Push.
-   */
+  /** Whether a new Android foreground-watch operation may use the current network. */
   canRunWatchSync(): boolean {
-    if (typeof navigator === 'undefined') return true; // test/non-DOM hosts: no network policy signal
+    if (typeof navigator === 'undefined') return true;
     if (navigator.onLine === false) return false;
     return !this.isBlockedByWifiOnly();
   }
 
-  /** True while a full-vault sync session is running. Used by external trigger schedulers. */
+  /** True while a full-vault sync session or its final persistence is active. */
   isSyncRunning(): boolean {
-    // `currentRun` stays non-null through the full session's final persistence, while `running` is
-    // cleared early in runSyncSession.finally. Treat both phases as busy to keep external triggers
-    // from entering during that small but stateful teardown window.
     return this.running || this.currentRun !== null;
   }
 
@@ -465,24 +464,156 @@ export class SyncEngine {
     await this.syncManualWithResult(opts);
   }
 
-  /**
-   * Client Push fallback needs to know whether an authoritative full-sync attempt really completed.
-   *
-   * Push is an automatic hint, not a user action. Do the two cheap guards here before entering the
-   * ordinary sync entry point so a race with startup/resume cannot emit user-facing "already in
-   * progress" / Wi-Fi-only guidance. Returning false is intentional: PushSyncScheduler keeps the
-   * reconciliation request pending and probes again after the blocker clears.
-   */
+  /** Client Push fallback needs to know whether an authoritative full-sync attempt really completed. */
   async syncForClientPush(): Promise<boolean> {
-    if (this.isSyncRunning()) {
-      void this.opts.logger?.log('client-push: full reconciliation deferred — full sync already running');
-      return false;
-    }
-    if (this.isBlockedByWifiOnly()) {
-      void this.opts.logger?.log('client-push: full reconciliation deferred — Wi-Fi-only blocks current network');
-      return false;
-    }
     return this.syncManualWithResult();
+  }
+
+  private async syncManualWithResult(opts: { manual?: boolean } = {}): Promise<boolean> {
+    // Mobile has no status bar; sync state (progress + result) is surfaced via NoticeStatusBar,
+    // which implements IStatusBar and is driven uniformly for every run. The two early-return
+    // guidance notices below still need an explicit mobile notice because those paths return
+    // before any syncing toast is created. Desktop keeps using the status bar (no popups).
+    void this.opts.logger?.log(`sync: start (manual=${opts.manual === true})`);
+    // Prevent concurrent runs (avoid clashing with watch mode or scheduled sync).
+    if (this.isSyncRunning()) {
+      void this.opts.logger?.log('sync: skipped — already running');
+      // Automatic triggers (startup / interval / resume) may legitimately race another full sync.
+      // That is a normal no-op, not something that should interrupt a mobile user with a toast.
+      // Keep the guidance only for an explicit user-initiated "Sync now" action.
+      if (Platform.isMobile && opts.manual === true) new Notice('⏳ A sync is already in progress.');
+      return false;
+    }
+    if (this.isBlockedByWifiOnly()) { // "Wi-Fi only" enabled and on cellular
+      void this.opts.logger?.log('sync: skipped — Wi-Fi-only and on cellular');
+      if (Platform.isMobile) new Notice('Sync skipped — you are on cellular and Wi-Fi only sync is on.', 6000);
+      return false;
+    }
+    // Set the balking flag synchronously (before any await) so a concurrent call still balks.
+    this.running = true;
+    this.cancelled = false;
+    // Full sync is exclusive with watch/lightweight operations. Existing lightweight work may
+    // finish first; once this writer is queued, later lightweight work waits behind it.
+    const run = this.activityGate.runExclusive(() => this.runSyncSession(opts.manual === true));
+    this.currentRun = run;
+    let completed = false;
+    try {
+      completed = await run;
+    } finally {
+      this.currentRun = null;
+      // The run is over, so deferred watch edits can be evaluated. Best-effort: a failure must not propagate out of "Sync now".
+      try {
+        await this.drainWatchPending();
+      } catch (err) {
+        console.warn('[SyncEngine] Deferred watch-mode sync failed:', err);
+      }
+    }
+    return completed;
+  }
+
+  private async runSyncSession(manual: boolean): Promise<boolean> {
+    // Created before the try so catch/finally can reference them even if the first step fails.
+    const summary = this.initSummary();
+    this.journal.beginRun(summary.startedAt);
+
+    let completed = false;
+    try {
+      // Connect INSIDE the try: if ensureClient() threw or hung outside it, the finally that clears `running` would be
+      // skipped and the engine would balk forever as "already running".
+      void this.opts.logger?.log('sync: connecting (ensureClient)');
+      await this.ensureClient();
+      this.plugins.begin();
+      this.invalidateRootEtagOnScopeChange();
+      this.syncProgress = { processed: 0, total: 0 };
+      this.opts.statusBar.setStatus('syncing', { automatic: !manual });
+
+      const isFirstSync = !this.opts.stateDB.getSyncToken() && this.opts.stateDB.getAllFiles().length === 0;
+
+      if (isFirstSync) {
+        await this.initialSync(summary);
+      } else {
+        await this.incrementalSync(summary);
+      }
+      completed = !this.cancelled;
+    } catch (err) {
+      console.error('[SyncEngine] Sync failed:', err);
+      void this.opts.logger?.log(`sync: FAILED — ${(err as Error).message}`, 'error');
+      new Notice(`❌ Sync failed: ${(err as Error).message}`, 6000);
+      this.recordError(summary, '', err);
+    } finally {
+      // Clear `running` FIRST: the teardown below can throw (state/history save), which would otherwise leave the
+      // engine permanently "running".
+      this.running = false;
+      this.journal.endRun();
+
+      void this.opts.logger?.log(
+        `sync: done up=${summary.uploadedCount} down=${summary.downloadedCount} ` +
+        `del=${summary.deletedCount} merged=${summary.mergedCount} conflicted=${summary.conflictedCount} err=${summary.errorCount} cancelled=${this.cancelled}`,
+      );
+      this.logSessionErrors(summary);
+      summary.completedAt = Date.now();
+      this.lastSummary = summary;
+      this.opts.stateDB.setLastSyncTime(Date.now());
+      this.finishPluginSession(summary);
+      await this.persistAfterSession();
+      const conflictCount = this.opts.stateDB.countConflicted();
+      this.opts.statusBar.setSyncComplete(
+        summary.uploadedCount, summary.downloadedCount,
+        conflictCount, summary.errorCount,
+      );
+      // Result display is owned by the status bar surface (StatusBarItem / NoticeStatusBar) via setSyncComplete.
+    }
+    return completed;
+  }
+
+  // A changed sync scope (or a state saved before the fingerprint existed) makes the stored root ETag
+  // meaningless: files that were out of scope never entered the tracked listing a short-circuit rebuilds
+  // (docs/spec.md §8a.5).
+  private invalidateRootEtagOnScopeChange(): void {
+    const { syncConfigFolder, configSync, excludedFolders, syncedCommunityPlugins } = this.opts.settings;
+    const fingerprint = computeSyncScopeFingerprint({ syncConfigFolder, configSync, excludedFolders, syncedCommunityPlugins });
+    if (this.opts.stateDB.getSyncScopeFingerprint() === fingerprint) return;
+    this.opts.stateDB.setRemoteRootEtag(null);
+    this.opts.stateDB.setSyncScopeFingerprint(fingerprint);
+  }
+
+  // Best-effort: a plugin-session failure must not escape the finally and mask the original error.
+  private finishPluginSession(summary: SyncSessionSummary): void {
+    try {
+      const out = this.plugins.finish();
+      summary.pluginsNeedingRestart = out.pluginsNeedingRestart;
+      if (out.invalidateRootEtag) this.opts.stateDB.setRemoteRootEtag(null);
+    } catch (e) {
+      void this.opts.logger?.log(`sync: plugin session finish failed — ${(e as Error).message}`, 'error');
+    }
+  }
+
+  // Best-effort: a save failure must not escape the finally and mask the original error.
+  private async persistAfterSession(): Promise<void> {
+    try {
+      await this.opts.stateDB.save();
+      await this.opts.historyStore?.save();
+    } catch (persistErr) {
+      console.error('[SyncEngine] Post-sync persistence failed:', persistErr);
+      void this.opts.logger?.log(`sync: post-sync save failed — ${(persistErr as Error).message}`, 'error');
+    }
+  }
+
+  // Selects the listed plugins for this session, then forgets tracking of plugins that must not be treated as
+  // removed from the server (docs/spec.md §7).
+  private async preparePluginSession(client: IWebDAVClient, remoteFiles: readonly RemoteFileInfo[]): Promise<void> {
+    await this.plugins.prepare(client, remoteFiles);
+    this.dropStalePluginTracking();
+  }
+
+  private dropStalePluginTracking(): void {
+    for (const id of this.plugins.staleTrackedIds()) {
+      dropSubtreeTracking({
+        stateDB: this.opts.stateDB,
+        mergeBase: this.mergeBase,
+        dropCleanSnapshot: (p) => this.resolution.dropCleanSnapshot(p),
+      }, pluginDirPath(id, this.opts.configDir));
+    }
   }
 
   /**
@@ -519,151 +650,19 @@ export class SyncEngine {
     return this.syncManualWithResult();
   }
 
-  private async syncManualWithResult(opts: { manual?: boolean } = {}): Promise<boolean> {
-    // Mobile has no status bar; sync state (progress + result) is surfaced via NoticeStatusBar,
-    // which implements IStatusBar and is driven uniformly for every run. The two early-return
-    // guidance notices below still need an explicit mobile notice because those paths return
-    // before any syncing toast is created. Desktop keeps using the status bar (no popups).
-    void this.opts.logger?.log(`sync: start (manual=${opts.manual === true})`);
-    // Prevent concurrent runs (avoid clashing with watch mode or scheduled sync).
-    if (this.isSyncRunning()) {
-      void this.opts.logger?.log('sync: skipped — already running');
-      // Automatic triggers (startup / interval / resume / recovery) may legitimately race another
-      // full sync. That is a normal no-op; only an explicit user-initiated Sync now needs guidance.
-      if (Platform.isMobile && opts.manual === true) new Notice('⏳ A sync is already in progress.');
-      return false;
-    }
-    if (this.isBlockedByWifiOnly()) { // "Wi-Fi only" enabled and on cellular
-      void this.opts.logger?.log('sync: skipped — Wi-Fi-only and on cellular');
-      if (Platform.isMobile) new Notice('Sync skipped — you are on cellular and Wi-Fi only sync is on.', 6000);
-      return false;
-    }
-    // Set the balking flag synchronously (before any await) so a concurrent call still balks, then
-    // run the body via a tracked promise so abortAndWait() can await this run's clean wind-down.
-    this.running = true;
-    this.cancelled = false;
-    // Full sync is exclusive with watch/remote single-path operations. The gate waits for operations
-    // that already started, while the synchronous `running=true` above prevents new guarded watch
-    // operations from entering ahead of us.
-    const run = this.activityGate.runExclusive(() => this.runSyncSession());
-    this.currentRun = run;
-    let completed = false;
-    try {
-      completed = await run;
-    } finally {
-      this.currentRun = null;
-      // C-5: the run is over (runSyncSession's finally already cleared `running`), so any watch-mode
-      // edit that arrived meanwhile can now be evaluated. Best-effort: a failure here must not
-      // propagate out of "Sync now" — the paths stay detectable as local changes for the next sync.
-      try {
-        await this.drainWatchPending();
-      } catch (err) {
-        console.warn('[SyncEngine] Deferred watch-mode sync failed:', err);
-      }
-    }
-    return completed;
-  }
-
-  /** The actual full-sync session body. Always runs under the {@link syncManual} balking guard. */
-  private async runSyncSession(): Promise<boolean> {
-    // Build the summary and tag this run BEFORE the try so the catch/finally can reference them even
-    // when the very first step fails.
-    const summary = this.initSummary();
-    this.journal.beginRun(summary.startedAt); // tag this run's history entries for grouping
-
-    let completed = false;
-    try {
-      // Feature 053: connect INSIDE the guard. ensureClient() (client creation + capabilities probe)
-      // can throw (network / auth / capabilities) or hang; if it ran outside this try, a failure would
-      // skip the finally that clears `running`, stranding the engine as "sync in progress" forever
-      // AND swallowing the real error (no FAILED log) — every later sync then balks with "already
-      // running", and a restart's startup sync re-triggers the same failure and re-strands it.
-      void this.opts.logger?.log('sync: connecting (ensureClient)');
-      await this.ensureClient();
-      this.syncProgress = { processed: 0, total: 0 };
-      this.opts.statusBar.setStatus('syncing');
-
-      const isFirstSync = !this.opts.stateDB.getSyncToken() && this.opts.stateDB.getAllFiles().length === 0;
-
-      if (isFirstSync) {
-        await this.initialSync(summary);
-      } else {
-        await this.incrementalSync(summary);
-      }
-      completed = !this.cancelled;
-    } catch (err) {
-      console.error('[SyncEngine] Sync failed:', err);
-      void this.opts.logger?.log(`sync: FAILED — ${(err as Error).message}`, 'error');
-      new Notice(`❌ Sync failed: ${(err as Error).message}`, 6000);
-      this.recordError(summary, '', err);
-    } finally {
-      // Clear the running flags FIRST. Everything below is best-effort teardown that can throw (a
-      // failed stateDB/historyStore save, a persistence I/O error); if the flag were cleared only at
-      // the end, such a throw would leave the engine permanently "running" and block every subsequent
-      // sync. Resetting up front guarantees the next sync can always start.
-      this.running = false;
-      this.journal.endRun();
-
-      void this.opts.logger?.log(
-        `sync: done up=${summary.uploadedCount} down=${summary.downloadedCount} ` +
-        `del=${summary.deletedCount} merged=${summary.mergedCount} conflicted=${summary.conflictedCount} err=${summary.errorCount} cancelled=${this.cancelled}`,
-      );
-      this.logSessionErrors(summary);
-      summary.completedAt = Date.now();
-      this.lastSummary = summary;
-      this.opts.stateDB.setLastSyncTime(Date.now());
-      // Best-effort persistence: a save failure must not propagate out of the finally (which would
-      // mask the original error and, before the flag move above, strand the running flag).
-      try {
-        await this.opts.stateDB.save();
-        await this.opts.historyStore?.save(); // persist this session's per-file outcomes (pruned to 24h)
-      } catch (persistErr) {
-        console.error('[SyncEngine] Post-sync persistence failed:', persistErr);
-        void this.opts.logger?.log(`sync: post-sync save failed — ${(persistErr as Error).message}`, 'error');
-      }
-      const conflictCount = this.opts.stateDB.countConflicted();
-      this.opts.statusBar.setSyncComplete(
-        summary.uploadedCount, summary.downloadedCount,
-        conflictCount, summary.errorCount,
-      );
-      // Result display is owned by the status bar surface: StatusBarItem on desktop, and
-      // NoticeStatusBar (a result toast) on mobile, both via setSyncComplete above. Genuine
-      // failures still surface via the catch-block notice / NextcloudErrorParser.
-    }
-    return completed;
-  }
-
-  /**
-   * Feature 065 (issue #25): write every collected per-file failure to the debug log.
-   *
-   * The summary line alone carries only `err=<count>`. That reporter's log said `err=162` and named
-   * none of the 162 paths, so the log — the one artefact a user can hand over — could not locate a
-   * single failure. The entries already exist for the status dialog; this puts them where they can
-   * be shared.
-   *
-   * Deliberately uncapped: a truncated list reads as "that was all of them" when it wasn't. Only
-   * path and message go in, never the server response body, because these logs get pasted into
-   * public issues (NetworkError keeps the body off `message` for the same reason).
-   */
-  /** @see SyncJournal.logSessionErrors */
   private logSessionErrors(summary: SyncSessionSummary): void {
     this.journal.logSessionErrors(summary);
   }
 
-  // ── Single-file lightweight operations (used by watch mode) ─────────────────
-  // These avoid a full vault scan / remote REPORT and only touch the one file.
 
-  /**
-   * Feature 046: reflect watch-mode (immediate) propagation on the status bar. Each in-flight
-   * single-file/folder op shows "syncing"; when the last one finishes the bar returns to idle. Guarded
-   * by `!this.running` so it never fights a concurrent full sync (which owns the status during its run).
-   */
-  // Delegators to the watch operations (feature 074). These are the plugin's watcher entry points,
-  // so they stay on the engine's public surface; the connection is resolved inside the module.
 
-  /** @see WatchOperations.syncSingleFile */
   syncSingleFile(path: string): Promise<void> {
     return this.watch.syncSingleFile(path);
+  }
+
+  /** Reconcile notify_push IDs without advancing the collection sync token. */
+  reconcileRemoteFileIds(batch: RemotePushBatch): Promise<RemoteBatchReconcileResult> {
+    return this.remotePush.reconcileFileIds(batch);
   }
 
   /**
@@ -683,20 +682,12 @@ export class SyncEngine {
     return retryCount() <= retriesBefore;
   }
 
-  /**
-   * Reconcile notify_push IDs without advancing the collection sync token. Only already-known files
-   * take the targeted path; structural/unknown cases return `full-sync` to the scheduler.
-   */
-  reconcileRemoteFileIds(batch: RemotePushBatch): Promise<RemoteBatchReconcileResult> {
-    return this.remotePush.reconcileFileIds(batch);
-  }
 
   /** @see WatchOperations.drainPending */
   private drainWatchPending(): Promise<void> {
     return this.watch.drainPending();
   }
 
-  /** @see WatchOperations.deleteSingleFile */
   deleteSingleFile(path: string): Promise<void> {
     return this.watch.deleteSingleFile(path);
   }
@@ -779,49 +770,25 @@ export class SyncEngine {
     }
   }
 
-  /** Persist any pending debounced state save now (call from the plugin's onunload). */
   async flushState(): Promise<void> {
     await this.opts.stateDB.flush();
     await this.opts.baseStore?.flush();
     await this.opts.cleanSideStore?.flush();
   }
 
-  /**
-   * Feature 038: record the last-synced body of `path` as the 3-way merge base, but ONLY for Auto
-   * Merge File types (text) — bases for binary / Other Files are pointless and skipped (FR-005).
-   * Called at every convergence point (download / upload / clean merge / one-side-wins / initial
-   * seed). The read side (handleConflict) uses the same `isAutoMergeFileType` classification so the
-   * two never disagree (FR-009). Persistence is coalesced via the store's debounced save.
-   */
-  /**
-   * Feature 049: the effective mass-delete breaker limit for `tracked` items, honouring the user's
-   * `massDeleteLimit` setting. -1 = the automatic dynamic limit (safe default); 0 = unlimited (breaker
-   * off, opt-in); N > 0 = a fixed absolute limit. Guards absence-based bulk deletion from a partial
-   * remote listing.
-   */
+  // massDeleteLimit: -1 = automatic dynamic limit, 0 = unlimited (breaker off), N > 0 = fixed limit (docs/spec.md §8).
   private effectiveMassDeleteLimit(tracked: number): number {
     return effectiveMassDeleteLimit(this.opts.settings.massDeleteLimit, tracked);
   }
 
-  /** @see MergeBaseRecorder.record */
-  private recordMergeBase(path: string, content: string): void {
-    this.mergeBase.record(path, content);
+  private recordMergeBase(path: string, body: ArrayBuffer): void {
+    this.mergeBase.recordBytes(path, body);
   }
 
-  /** @see MergeBaseRecorder.drop */
   private dropMergeBase(path: string): void {
     this.mergeBase.drop(path);
   }
 
-  /**
-   * Feature 044: capture the two CLEAN sides of a note at conflict-detection time, before a marker
-   * write overwrites them. Only called on the marker-write path (clean:false). Metrics are the clean
-   * sides' own mtime/size, used later by the Latest/Biggest force-resolution choices.
-   */
-  // Delegators to the resolution service (feature 074). The connection is resolved here because the
-  // client and upload strategy are created lazily and can be replaced.
-
-  /** @see ResolutionService.captureCleanSides */
   private captureCleanSides(
     path: string, local: string, remote: string,
     localMtime: number, localSize: number, remoteInfo: RemoteFileInfo,
@@ -829,43 +796,28 @@ export class SyncEngine {
     this.resolution.captureCleanSides(path, local, remote, localMtime, localSize, remoteInfo);
   }
 
-  /** @see ResolutionService.dropCleanSnapshot */
   private dropCleanSnapshot(path: string): void {
     this.resolution.dropCleanSnapshot(path);
   }
 
-  /** @see ResolutionService.sweepResolvedSnapshots */
   private sweepResolvedSnapshots(): void {
     this.resolution.sweepResolvedSnapshots();
   }
 
-  /** @see ResolutionService.cleanSideMetrics */
   cleanSideMetrics(path: string): CleanSideMetrics | null {
     return this.resolution.cleanSideMetrics(path);
   }
 
-  /** @see ResolutionService.applyCleanRemote */
   async applyCleanRemote(path: string): Promise<void> {
     return this.resolution.applyCleanRemote(await this.connection(), path);
   }
 
-  /** @see ResolutionService.applyCleanLocal */
   async applyCleanLocal(path: string): Promise<void> {
     return this.resolution.applyCleanLocal(await this.connection(), path);
   }
 
-  /**
-   * Feature 056: resolve one skipped mass-delete-breaker directory candidate immediately (not
-   * deferred to the next sync). `category` is which side reconcileDirectories would have deleted from
-   * (`deleteRemote`: local absent/remote present; `trashLocal`: local present/remote absent). `choice`
-   * mirrors the file-conflict force-resolution meaning: "remote" always means "make local match
-   * remote", "local" always means "make remote match local" — expressed here as directory create/
-   * delete instead of file push/pull. Recreated directories are tracked with `remoteFileId: null`
-   * (the same self-healing pattern already used by createSingleFolder/renameSingleFolder — the next
-   * full sync's real PROPFIND fills in the real id once both sides exist again). Throws on failure
-   * without touching StateDB (the caller, `resolveAllSkippedDirs`, isolates per-path failures).
-   */
-  /** @see DirectoryReconciler.resolveSkippedDir */
+  // "remote" makes local match remote, "local" makes remote match local (directory create/delete).
+  // Throws on failure without touching StateDB (docs/spec.md §8).
   async resolveSkippedDir(
     path: string,
     category: 'deleteRemote' | 'trashLocal',
@@ -875,25 +827,8 @@ export class SyncEngine {
     return this.directories.resolveSkippedDir(client, path, category, choice);
   }
 
-  /**
-   * Feature 056: bulk-apply one choice to every path in the current `(dir mass-delete breaker)`
-   * session error's `dirBreakerSkipped`, sequentially (mirrors applyBulkForceResolution's sequencing
-   * and per-path failure isolation — a per-path rejection is tallied, not thrown). On completion,
-   * mutates `this.lastSummary.errors` IN PLACE: removes the breaker entry once every path resolved,
-   * or narrows its `dirBreakerSkipped` to only the still-failed paths otherwise — so the next
-   * `getStatusReport()` (which returns the same `lastSummary` reference, not a clone) reflects the
-   * outcome immediately, without waiting for a fresh full sync. Refuses to run while a full sync is
-   * in progress (`this.running`): a concurrent reconcileDirectories reads/writes the same StateDB
-   * directory rows this touches, so racing it is worth refusing outright rather than risking a
-   * mkdir-then-immediately-trash flicker on the same path.
-   */
-  /**
-   * @see DirectoryReconciler.resolveAllSkippedDirs
-   *
-   * Refuses to run while a full sync is in progress: a concurrent reconcileDirectories reads and
-   * writes the same StateDB directory rows this touches, so racing it is worth refusing outright
-   * rather than risking a mkdir-then-immediately-trash flicker on the same path.
-   */
+  // Mutates lastSummary.errors in place, so the next getStatusReport() reflects the outcome. Refuses during a full sync:
+  // reconcileDirectories writes the same StateDB directory rows, risking a mkdir-then-trash flicker on one path.
   async resolveAllSkippedDirs(choice: 'remote' | 'local'): Promise<{ resolved: number; failed: number }> {
     if (this.running) throw new Error('Cannot resolve skipped directories — sync in progress');
     const { client } = await this.ensureClient();
@@ -901,65 +836,35 @@ export class SyncEngine {
   }
 
 
-  /**
-   * Two-Phase Termination — phase 1: signal an in-flight sync to stop pulling new work. Idempotent
-   * and safe to call any time; the running sync's finally block still persists state (phase 2).
-   */
+  // Phase 1 of termination: signal workers to stop pulling work; the run's finally block still persists state.
   requestStop(): void {
     this.cancelled = true;
   }
 
-  /**
-   * Abort an in-flight sync and wait for it to fully settle (including its finally state save) so a
-   * follow-up maintenance reset cannot interleave with the run's persistence. Idempotent and safe to
-   * call when idle (resolves immediately). The run handles its own errors, so awaiting never throws.
-   */
+  // Waits for the run's final state save so a following reset cannot interleave with it. Never throws.
   async abortAndWait(): Promise<void> {
     this.requestStop();
     const run = this.currentRun;
     if (run) {
       try { await run; } catch { /* runSyncSession swallows its own errors */ }
     }
+    // A restore also changes StateDB and the local file. Maintenance must wait for its save, too.
+    await this.activityGate.runExclusive(() => undefined);
   }
 
-  /**
-   * Maintenance action: abort any in-flight sync, then reset this device's tracking index ("Vault
-   * index") to the first-install empty state. The next sync then runs as a first-run sync. No vault
-   * or remote file is touched.
-   */
+  // Resets only the tracking index; no vault or remote file is touched, so the next sync runs as a first sync.
   async resetIndex(): Promise<void> {
     await this.abortAndWait();
     await this.opts.stateDB.reset();
   }
 
-  /**
-   * Maintenance action (feature 045): compute a Pull-mirror plan — what to download and what local
-   * files/folders to delete so this device exactly matches the remote. Side-effect free (reads only),
-   * so the caller can show the download/delete counts for confirmation before applying.
-   *
-   * Safety gate (FR-009): the authoritative listing is a REAL PROPFIND (`getFiles('')`, no root-ETag
-   * short-circuit). If it fails, the plan is `ok:false` with empty lists so the caller performs zero
-   * deletions. The mass-delete breaker's COUNT limit is intentionally NOT consulted here (FR-008): the
-   * user explicitly declared the remote authoritative; this path simply never calls `massDeleteLimit`.
-   */
-  /** @see MirrorService.planRemoteMirror */
+  // Read-only. The listing is a real PROPFIND (no root-ETag short-circuit); on failure the plan is ok:false so nothing is
+  // deleted. The mass-delete limit is deliberately not consulted: the user declared the remote authoritative (docs/spec.md §14).
   planRemoteMirror(onPhase?: (label: string) => void): Promise<MirrorPlan> {
     return this.mirror.planRemoteMirror(onPhase);
   }
 
-  /**
-   * Apply a Pull-mirror plan produced by {@link planRemoteMirror}: download everything the remote has
-   * (or that differs), delete local-only files/folders (via the user's Obsidian "Deleted files"
-   * setting — recoverable), then reconcile StateDB to the remote so the next normal sync converges to
-   * zero diff (FR-011 / SC-002). The caller must pass an `ok:true` plan and have aborted in-flight sync.
-   */
-  /**
-   * @see MirrorService.applyRemoteMirror
-   *
-   * Uses the ALREADY-resolved client rather than connecting: apply always follows a plan, and
-   * planRemoteMirror is what connects. Adding an ensureClient here would introduce a connect step
-   * where the code never had one.
-   */
+  // Uses the already-resolved client: apply always follows a plan, and planRemoteMirror is what connects.
   applyRemoteMirror(
     plan: MirrorPlan, onProgress?: (done: number, total: number) => void,
   ): Promise<MirrorResult> {
@@ -970,21 +875,12 @@ export class SyncEngine {
     return this.lastSummary;
   }
 
-  /**
-   * When the last sync finished, as a persisted wall-clock timestamp (0 if none ever has).
-   *
-   * Unlike {@link getLastSessionSummary}, which only knows about this process, this survives restarts
-   * and is stamped by every sync whatever started it. Feature 079's resume trigger uses it as its
-   * cooldown baseline, which is also what stops it from firing on top of the startup sync.
-   */
+  // Persisted, so it survives restarts and is stamped by every sync; the resume trigger uses it as its cooldown
+  // baseline (docs/spec.md §5.8).
   getLastSyncTime(): number {
     return this.opts.stateDB.getLastSyncTime();
   }
 
-  /**
-   * Snapshot for the status-bar dialog: last session summary plus the current lists of
-   * conflicted files and files queued for retry (the two things the status bar counts).
-   */
   getStatusReport(): {
     summary: SyncSessionSummary | null;
     conflictedFiles: string[];
@@ -1002,65 +898,48 @@ export class SyncEngine {
     };
   }
 
-  /** @see ResolutionService.getUnresolvedConflictCount */
   getUnresolvedConflictCount(): Promise<number> {
     return this.resolution.getUnresolvedConflictCount();
   }
 
-  /** @see ResolutionService.compareWithRemote */
   async compareWithRemote(path: string): Promise<RemoteCompareResult> {
     const { client } = await this.ensureClient();
     return this.resolution.compareWithRemote(client, path);
   }
 
 
-  /** @see ResolutionService.pushLocalToRemote */
   async pushLocalToRemote(path: string): Promise<void> {
     return this.resolution.pushLocalToRemote(await this.connection(), path);
   }
 
-  /** @see ResolutionService.pullRemoteToLocal */
   async pullRemoteToLocal(path: string): Promise<void> {
     const { client } = await this.ensureClient();
     return this.resolution.pullRemoteToLocal(client, path);
   }
 
-  /** Binds the configured Auto Merge File types for {@link isTextEligible}. */
   private textEligible(path: string): boolean {
     return isTextEligible(path, this.opts.settings.autoMergeFileTypes);
   }
 
-  /** @see ResolutionService.fetchRemoteInfo */
   private fetchRemoteInfo(path: string): Promise<RemoteFileInfo | null> {
     return this.resolution.fetchRemoteInfo(this.client!, path);
   }
 
-  /**
-   * The ALREADY-resolved client and upload strategy. Deliberately does not connect: the conflict
-   * paths run inside a sync that has connected, and adding an ensureClient here would introduce a
-   * connect step where the code never had one.
-   */
+  // Deliberately does not connect: the conflict paths run inside an already-connected sync.
   private currentConnection(): { client: IWebDAVClient; uploadStrategy: IUploadStrategy } {
     return { client: this.client!, uploadStrategy: this.uploadStrategy! };
   }
 
-  /** The connected client plus its upload strategy, for services that need both. */
   private async connection(): Promise<{ client: IWebDAVClient; uploadStrategy: IUploadStrategy }> {
     const { client } = await this.ensureClient();
     return { client, uploadStrategy: this.uploadStrategy! };
   }
 
-  // ── Private ──────────────────────────────────────────────────────────────
 
-  // Delegators to the session modules (feature 074). They neither bind nor decide; they keep the
-  // ~70 existing call sites — and the suites that drive them through the engine — unchanged.
-
-  /** @see SyncJournal.newSummary */
   private initSummary(): SyncSessionSummary {
     return this.journal.newSummary();
   }
 
-  /** @see SyncJournal.recordError */
   private recordError(
     summary: SyncSessionSummary,
     path: string,
@@ -1071,27 +950,12 @@ export class SyncEngine {
     this.journal.recordError(summary, path, err, skippedPaths, dirBreakerSkipped);
   }
 
-  /** @see SyncJournal.recordHistory */
   private recordHistory(path: string, op: SyncFileOp, message?: string, detail?: SyncHistoryDetail): void {
     this.journal.recordHistory(path, op, message, detail);
   }
 
-  /**
-   * The vault folder is gone from the server: put it back and re-seed it from this device
-   * (feature 083, FR-007..013). Never deletes anything locally.
-   *
-   * A whole missing folder proves nothing about any individual file — a renamed or half-migrated
-   * remote, a permission change and a genuine "the user deleted the vault" all look identical from
-   * here — and the folder's remote path is derived from the vault name by the plugin, so the user
-   * cannot be told to recreate it. Treating this as "every file was deleted" would therefore trade a
-   * server-side accident for local data loss. Local wins instead; a user who really wants the remote
-   * to win has "Mirror from remote".
-   *
-   * The MKCOL is the proof. 201 means the folder truly was not there, so resetting tracking and
-   * re-uploading is a restoration. 405 means it IS there and the 404 listing was wrong — in which
-   * case nothing may be reset or deleted, because the next real scan is the only thing that can tell
-   * us what the server actually holds. Any other MKCOL failure lands in the same place.
-   */
+  // A missing vault folder proves nothing about individual files, so local wins and nothing is deleted locally (docs/spec.md §8).
+  // The MKCOL is the proof: 201 = truly absent (reset and re-upload); 405 = the 404 listing was wrong, so change nothing.
   private async reseedFromLocal(summary: SyncSessionSummary): Promise<void> {
     const outcome = await this.client!.createVaultRoot();
     if (outcome === 'exists') {
@@ -1103,20 +967,16 @@ export class SyncEngine {
     }
     void this.opts.logger?.log('sync: vault folder missing on the server → created it; re-seeding from local (tracking reset, no local deletions)');
     new Notice('The vault folder was missing on the server. It has been re-created and this vault is being re-uploaded from this device.', 8000);
-    // Reset rather than force-upload: the first-run path already uploads every local file and MKCOLs
-    // every local folder (empty ones included) against an empty remote, and it is covered by tests.
-    // Reproducing that with a "force" flag would duplicate it — and quietly drift from it.
+    // Reset rather than force-upload: the first-run path already uploads every local file and MKCOLs every local folder
+    // against an empty remote.
     await this.opts.stateDB.reset();
     await this.initialSync(summary);
   }
 
-  /** First-ever sync: full scan → build plan → execute. */
   private async initialSync(summary: SyncSessionSummary): Promise<void> {
     const client = this.client!;
-    // With nothing tracked yet there is no deletion to get wrong, so a missing vault folder is simply
-    // "the server has nothing" — the pre-083 reading, preserved here so a first run against a fresh
-    // server behaves exactly as it always has (INIT-1/2/3): the first upload creates the hierarchy.
-    // This also covers the re-seed path, which calls in right after creating the folder.
+    // With nothing tracked, a missing vault folder just means the server has nothing; the first upload creates the hierarchy
+    // (also covers the re-seed path).
     let remoteFiles: RemoteFileInfo[];
     try {
       remoteFiles = await client.getFiles('');
@@ -1125,16 +985,15 @@ export class SyncEngine {
       void this.opts.logger?.log('sync: INITIAL — no vault folder on the server yet; the first upload will create it');
       remoteFiles = [];
     }
+    await this.preparePluginSession(client, remoteFiles);
     const localFiles = await this.scanLocalFiles();
 
-    // Populate missing server-side checksums (computed by the server, no download) so that
-    // files already identical on both sides are recognised as unchanged instead of conflicts.
+    // Server-computed checksums (no download) let identical files count as unchanged rather than conflicts.
     await this.remoteListing.resolveRemoteChecksums(client, remoteFiles, localFiles);
 
     const plan = await this.buildInitialPlan(localFiles, remoteFiles);
-    // No recorded state yet, so every local file the server lacks is planned as an UPLOAD —
-    // including files that were deleted on another device. This is a resurrection path; log the
-    // plan (and the would-be uploads) so a captured log shows whether a "deleted" file is pushed back.
+    // With no recorded state, every local file the server lacks is an UPLOAD, including files deleted on another device
+    // (resurrection path); the plan is logged for that reason.
     void this.opts.logger?.log(
       `sync: INITIAL sync (empty state) plan — up=${plan.uploads.length} down=${plan.downloads.length} ` +
       `unchanged=${plan.unchanged.length} conflicts=${plan.conflicts.length}. ` +
@@ -1144,30 +1003,24 @@ export class SyncEngine {
 
     await this.executePlan(plan, remoteFiles, summary, localFiles);
 
-    // Initial sync is always a complete listing → reconcile directory create/delete (DP).
+    // A complete listing, so directory create/delete can be reconciled.
     await this.reconcileDirectories(summary);
 
-    // Save sync-token
     const token = await client.getSyncToken();
     this.opts.stateDB.setSyncToken(token);
   }
 
-  /** Incremental sync using sync-token (falls back to full PROPFIND on 410) */
   private async incrementalSync(summary: SyncSessionSummary): Promise<void> {
     const client = this.client!;
     let remoteFiles: RemoteFileInfo[];
-    // True when remoteFiles is the COMPLETE remote listing (so absence implies a remote deletion).
-    // False in the token path, where remoteFiles is only the partial set of changed files.
+    // True when remoteFiles is the COMPLETE listing (absence implies remote deletion); false on the token path's partial diff.
     let isFullScan = false;
-    // Set (non-null) when the full scan was short-circuited (spec 023): the directory listing rebuilt
-    // from State, fed to reconcileDirectories so it too skips getDirectories('').
+    // Non-null when the root-ETag short-circuit rebuilt the directory list from State; reuse it to skip getDirectories('') (docs/spec.md §8a.5).
     let fullScanCachedDirs: RemoteDirInfo[] | null = null;
 
     const existingToken = this.opts.stateDB.getSyncToken();
-    // A missing vault folder surfaces from whichever listing call is made below — including the
-    // token-expired fallback, which is why the guard wraps both branches rather than one. The token
-    // REPORT itself is not a concern: Nextcloud answers 415 (§18 F1) so that branch is unreachable
-    // there, and a server that does support it reports changes, never the root's absence.
+    // A missing vault folder can surface from any listing call below, including the token-expired fallback, hence one guard
+    // around both. Nextcloud answers the token REPORT with 415 (docs/spec.md §18), so that branch is unreachable there.
     try {
       if (existingToken) {
         try {
@@ -1176,21 +1029,19 @@ export class SyncEngine {
           remoteFiles = changes.modified;
           void this.opts.logger?.log(`sync: incremental via token (modified=${changes.modified.length}, remote-deleted=${changes.deleted.length})`);
 
-          // Detect and apply remote renames (fileId-based) before processing deletions,
-          // so a rename is not misidentified as delete + new-upload.
+          // Apply remote renames (fileId-based) before deletions so a rename is not seen as delete + new upload.
           const rt = this.getOrCreateRenameTracker();
           const remoteRenames = rt.detectRemoteRenames(remoteFiles);
           for (const [oldPath, newPath] of remoteRenames) {
             await rt.applyRemoteRename(oldPath, newPath);
           }
 
-          // Handle deletions
           for (const deletedPath of changes.deleted) {
             await this.processRemoteDeletion(deletedPath, summary);
           }
         } catch (err) {
           if (err instanceof SyncTokenExpiredError) {
-            // Fallback to full scan (root-ETag short-circuit may rebuild the listing from State — spec 023).
+            // Fall back to a full scan (the root-ETag short-circuit may rebuild the listing from State).
             const listing = await this.obtainFullScanListing(client);
             remoteFiles = listing.remoteFiles;
             fullScanCachedDirs = listing.cachedDirs;
@@ -1203,8 +1054,7 @@ export class SyncEngine {
           }
         }
       } else {
-        // No prior token (the common Nextcloud case: sync-collection REPORT is unsupported, spec §18 F1,
-        // so every sync lands here). Root-ETag short-circuit may rebuild the listing from State (spec 023).
+        // No prior token (the common Nextcloud case: sync-collection REPORT is unsupported, docs/spec.md §18), so every sync lands here.
         const listing = await this.obtainFullScanListing(client);
         remoteFiles = listing.remoteFiles;
         fullScanCachedDirs = listing.cachedDirs;
@@ -1219,44 +1069,34 @@ export class SyncEngine {
       return;
     }
 
-    // Retry queue files
-    const retried = this.retryQueue.splice(0);
-    summary.retriedFiles = retried;
+    summary.retriedFiles = this.retryQueue.splice(0);
 
-    // Process each remote file
+    await this.preparePluginSession(client, remoteFiles);
     const eligible = remoteFiles.filter(f => !this.isSystemExcluded(f.path));
     this.syncProgress = { processed: 0, total: eligible.length };
     if (eligible.length > 0) this.opts.statusBar.setProgress(0, eligible.length);
-    // Bounded-parallel (P1-A): each remote file is processed by one worker; uploads to the same
-    // directory are serialized to avoid 423s. processFileWithRetry already handles its own errors.
+    // Bounded parallel; uploads to the same directory are serialized to avoid 423s. A plugin's manifest.json goes last so a
+    // half-written bundle never advertises a new version (docs/spec.md §7).
+    const { rest, manifests } = partitionPluginManifestsLast(eligible, (f) => f.path, this.opts.configDir);
     await this.runFileBatch(
-      eligible,
+      [...rest, ...manifests],
       (r) => r.path,
       (r) => r.size,
       async (r) => { await this.processFileWithRetry(r, summary); this.tickProgress(); },
       true,
     );
 
-    // Process local modifications (files in stateDB not covered by remote changes)
     await this.processLocalModifications(remoteFiles, summary, isFullScan);
 
-    // Reconcile directory create/delete only from a COMPLETE listing (full scan). The token path's
-    // remoteFiles is a partial diff, from which directory absence cannot be read as a deletion.
-    // On a short-circuited scan, feed the State-rebuilt directory list so getDirectories('') is skipped.
+    // Only a COMPLETE listing can show directory absence; the token path's partial diff cannot.
     if (isFullScan) await this.reconcileDirectories(summary, fullScanCachedDirs ?? undefined);
 
-    // Feature 044 self-heal: drop captured clean sides for any path that converged this sync (no longer
-    // conflicted), keeping snapshots bounded to currently-conflicted files regardless of the path taken.
+    // Drop captured clean sides for paths that converged, keeping snapshots bounded to currently-conflicted files.
     this.sweepResolvedSnapshots();
 
-    // Root-ETag short-circuit SAFETY (spec 023 §8a.5): only ARM the short-circuit when this scan fully
-    // converged (StateDB now mirrors the remote). If any file was left UNRESOLVED — a conflict skipped
-    // by the 'error' policy, conflict markers, an error, or a queued retry — StateDB.remoteId may stay
-    // stale relative to the actual remote while the remote root ETag is unchanged (no push happened).
-    // A later short-circuit would then rebuild the remote listing from that stale State and silently
-    // "resolve" the unresolved remote change as local-wins, OVERWRITING the other device's edit (data
-    // loss). Invalidating the stored root ETag forces a real full scan next time, so the conflict is
-    // re-detected instead. Self-healing: convergence (no conflicts) re-arms it on a later scan.
+    // Arm the root-ETag short-circuit only after a fully converged scan: with unresolved files, State may be stale against
+    // an unchanged root ETag, and a short-circuit would resolve the remote change as local-wins and overwrite the other device's edit.
+    // Invalidating the ETag forces a real full scan next time; convergence re-arms it (docs/spec.md §8a.5).
     if (summary.conflictedCount > 0 || summary.errorCount > 0 || this.retryQueue.length > 0) {
       this.opts.stateDB.setRemoteRootEtag(null);
     }
@@ -1270,7 +1110,6 @@ export class SyncEngine {
         console.warn(`[SyncEngine] Error syncing ${remote.path}, queuing retry:`, err);
         this.retryQueue.push(remote.path);
         this.recordError(summary, remote.path, err);
-        // Continue with next file (FR-015)
       } else {
         // Local I/O errors (ENOENT, EACCES, etc.) must not abort the entire session.
         console.warn(`[SyncEngine] Error syncing ${remote.path}:`, err);
@@ -1280,12 +1119,8 @@ export class SyncEngine {
     }
   }
 
-  /**
-   * Local-unchanged fast-path (P0-A). Binds the ambient clock and the last-sync time; the decision
-   * itself — including the safety-window guard around both — lives in `./policy`, where its
-   * boundaries can be exercised without standing up an engine. Both are passed as accessors so the
-   * state DB is still consulted only when the check gets that far (see the policy function).
-   */
+  // The decision (including the safety-window guard) lives in ./policy; clock and last-sync time are accessors so StateDB
+  // is consulted only when needed.
   private isLocallyUnchanged(base: FileState, stat: { mtime: number; size: number }): boolean {
     return isLocallyUnchangedPure(base, stat, {
       now: () => Date.now(),
@@ -1293,25 +1128,13 @@ export class SyncEngine {
     });
   }
 
-  /** @see withLocalSignature (src/data/localSignature.ts) */
   private withLocalSignature(fs: FileState, remoteMtime?: number | null): Promise<FileState> {
     return withLocalSignature(this.opts.localAdapter, fs, remoteMtime);
   }
 
-  /**
-   * Run per-file `worker`s with bounded concurrency (P1-A). Concurrency is capped by the configured
-   * `networkConcurrency` (count) AND by total in-flight bytes (ByteSemaphore), because `requestUrl`
-   * buffers whole bodies in memory and a count-only cap would OOM on large files (mobile budget is
-   * smaller). When `serializeByDir` is true, workers whose paths share a parent directory run
-   * sequentially (different directories run in parallel) to avoid Nextcloud directory-lock 423s.
-   *
-   * Distinct paths are processed by exactly one worker each, and StateDB get/set/delete are synchronous
-   * map ops, so per-file state mutations across different paths cannot interleave-corrupt; save() is
-   * already serialized by StateDB.saveChain. The byte size is acquired before the worker reads the
-   * file. A worker that throws is reported by the caller-supplied worker itself (it must not reject
-   * the batch — workers here are expected to handle their own errors, mirroring the prior sequential
-   * try/catch per file).
-   */
+  // Concurrency is capped by networkConcurrency AND by in-flight bytes (ByteSemaphore): requestUrl buffers whole bodies,
+  // so a count-only cap would OOM on large files. With serializeByDir, same-directory workers run sequentially to avoid
+  // directory-lock 423s. Workers must handle their own errors and never reject the batch (docs/plan.md §11).
   private async runFileBatch<T>(
     items: T[],
     pathOf: (it: T) => string,
@@ -1323,12 +1146,10 @@ export class SyncEngine {
     const max = Math.max(1, this.opts.settings.networkConcurrency);
     const limiter = createLimiter(max);
     const budget = new ByteSemaphore(Platform.isMobile ? MAX_INFLIGHT_BYTES_MOBILE : MAX_INFLIGHT_BYTES_DESKTOP);
-    // Per-parent-directory promise chains: each new same-dir task waits on the previous one.
     const dirChains = new Map<string, Promise<void>>();
 
     const tasks = items.map((it) => limiter(async () => {
-      // Two-Phase Termination: once a stop is requested, queued workers no-op so the batch drains
-      // without launching further network operations.
+      // After requestStop(), queued workers no-op so no further network calls start.
       if (this.cancelled) return;
       const runOne = async (): Promise<void> => {
         const release = await budget.acquire(Math.max(0, sizeOf(it)));
@@ -1362,63 +1183,49 @@ export class SyncEngine {
     let localHash = base?.localHash ?? '';
 
     if (localStat && base) {
-      // Fast-path: skip reading/hashing when the post-write stat signature still matches (P0-A).
-      // The signature (localMtime/localSize) is what we observed right after our own last write, so
-      // it is valid on mobile where the on-disk mtime never equals the remote mtime. Only when the
-      // signature says "changed" (or is absent, or the file was touched within the safety window) do
-      // we read + hash to confirm a real content change against base.localHash.
+      // Skip reading/hashing while the post-write stat signature still matches; unlike on-disk mtime, it is valid on mobile
+      // (docs/plan.md §4).
       if (!this.isLocallyUnchanged(base, localStat)) {
         const buf = await this.opts.localAdapter.readBinary(remote.path);
         localHash = await sha256(buf);
         localChanged = localHash !== base.localHash;
       }
     } else if (localStat) {
-      // Feature 063 (issue #23): the file exists on BOTH sides but we have NO recorded baseline, so
-      // there is nothing to prove it came from this remote. Treating "no base" as "local unchanged"
-      // (the old behaviour, since this branch simply did not exist) let the !localChanged &&
-      // remoteChanged arm below download straight over a local edit — silent data loss, e.g. when the
-      // same note was created independently on two devices. Hash the local body and treat it as
-      // CHANGED unless it provably matches the remote, so the both-changed arm resolves it as a
-      // conflict — exactly what initialSync already does via plan.conflicts.
+      // The file exists on both sides with no baseline: treating that as "local unchanged" would download over a local edit
+      // (issue #23). Hash it and treat it as changed unless provably equal, so the both-changed arm resolves it as a conflict.
       const buf = await this.opts.localAdapter.readBinary(remote.path);
       localHash = await sha256(buf);
-      if (idType === 'sha256' && localHash === remoteId) {
-        // Provably the same bytes on both sides: the only thing missing was the record. Seed it and
-        // converge without moving any data. Identity is asserted from the SERVER-SUPPLIED CHECKSUM
-        // only — an ETag is an opaque, server-defined token that cannot be recomputed from local
-        // content, so trusting it here would reintroduce the very overwrite this branch prevents.
-        // Without a checksum we fall through to conflict resolution, which fetches the remote and
-        // compares the real bytes (a wasted round-trip at worst, never data loss).
-        void this.opts.logger?.log(`sync: untracked file matches remote checksum → seeding state, no transfer → ${remote.path}`);
-        this.opts.stateDB.setFile(await this.withLocalSignature({
-          path: remote.path, localHash, remoteId, idType,
-          size: localStat.size, mtime: remote.lastModified || localStat.mtime,
-          remoteFileId: remote.fileId, isConflicted: false,
-        }, remote.lastModified));
-        return;
-      }
       localChanged = true;
     } else {
-      localChanged = false; // new from remote
+      localChanged = false;
     }
 
-    // Previously synced (base exists) but now gone locally → this device deleted it. Propagate the
-    // deletion instead of re-downloading it (which resurrects the file) or stranding it on the server.
+    const plugin = { localPresent: localStat !== null, localHash, localChanged, remoteId, idType };
+    if (await this.applyPluginFileAction(remote, base, plugin, summary)) return;
+
+    // Previously synced but gone locally: this device deleted it. Propagate rather than re-download (which resurrects it).
     if (!localStat && base) {
       await this.applyLocalDeletion(remote, base, remoteId, idType, summary);
       return;
     }
 
+    // Identical content is never transferred, whatever the baseline says (docs/spec.md §5.3a).
+    if (localStat && (remoteChanged || localChanged)
+        && localStat.size === remote.size && checksumProvesIdentical(remote, localHash)) {
+      void this.opts.logger?.log(`sync: content identical to the remote (checksum) → state converged, no transfer → ${remote.path}`);
+      const state = convergedState(remote, localHash, localStat, base);
+      if (base?.isConflicted) {
+        try { state.isConflicted = hasCompleteMarkerSet(await this.opts.localAdapter.read(remote.path)); }
+        catch { state.isConflicted = true; }
+      }
+      this.opts.stateDB.setFile(await this.withLocalSignature(state, remote.lastModified));
+      await this.creationTime.align(this.client!, remote, localStat);
+      return;
+    }
+
     if (!remoteChanged && !localChanged) {
-      // A genuinely converged baseline records the SAME size on both sides. If the
-      // recorded base.size disagrees with the actual local size while the ids still
-      // "match", the baseline is internally inconsistent (e.g. a prior resolution
-      // recorded base.localHash from one side but base.size/remoteId from the other).
-      // This happens on servers that supply no content checksum (idType==='etag'),
-      // where convergence cannot be proven by hashing alone. Treating it as
-      // "unchanged" hides a real local/remote divergence forever, so reconcile it
-      // via conflict resolution (downloads remote, compares real content, honors the
-      // configured policy) instead of silently skipping.
+      // A converged baseline records the same size on both sides. A mismatch despite matching ids means the baseline is
+      // inconsistent (typical without a content checksum, idType 'etag'), so reconcile via conflict resolution instead of skipping.
       if (base && localStat && localStat.size !== base.size) {
         void this.opts.logger?.log(
           `sync: divergent baseline detected (idType=${idType}, localSize=${localStat.size}, baseSize=${base.size}) → reconciling ${remote.path}`,
@@ -1426,10 +1233,6 @@ export class SyncEngine {
         await this.handleConflict(remote.path, base, remote, remoteId, idType, summary);
         return;
       }
-      // Equal local/remote bytes prove transport convergence, but they do not necessarily prove
-      // conflict resolution. Marker conflicts are intentionally uploaded so every device sees the
-      // same unresolved choice; keep that flag until the complete plugin marker set is removed.
-      // A newly learned Nextcloud fileId can still be refreshed independently of conflict state.
       const remoteFileIdChanged =
         remote.fileId !== null &&
         base?.remoteFileId !== remote.fileId;
@@ -1454,53 +1257,83 @@ export class SyncEngine {
         }
       }
 
-      if (base && (base.isConflicted || remoteFileIdChanged)) {
+      if (base && (base.isConflicted !== keepConflict || remoteFileIdChanged)) {
         this.opts.stateDB.setFile({
           ...base,
           remoteFileId: remote.fileId ?? base.remoteFileId,
           isConflicted: keepConflict,
         });
       }
-      return; // Unchanged
+      await this.creationTime.align(this.client!, remote, localStat);
+      return;
     }
 
     if (localChanged && !remoteChanged) {
-      try {
-        await this.uploadFile(remote.path, localHash, remoteId, idType, remote, summary);
-      } catch (err) {
-        // P1-B: If-Match 412 means the remote changed between our PROPFIND/REPORT and the PUT — treat
-        // it as a both-sides conflict (download remote + resolve) instead of overwriting (lost update).
-        if (err instanceof PreconditionFailedError) {
-          void this.opts.logger?.log(`upload: If-Match 412 (remote changed during sync) → conflict → ${remote.path}`);
-          await this.handleConflict(remote.path, base, remote, remoteId, idType, summary);
-        } else {
-          throw err;
-        }
-      }
+      await this.uploadOrConflict(remote, base, localHash, remoteId, idType, summary);
     } else if (!localChanged && remoteChanged) {
       if (this.deferIfBeingEdited(remote.path, 'download')) return;
       await this.downloadFile(remote, remoteId, idType, summary);
     } else {
-      // Both changed: Conflicted
       if (this.deferIfBeingEdited(remote.path, 'conflict')) return;
       await this.handleConflict(remote.path, base, remote, remoteId, idType, summary);
     }
   }
 
-  /**
-   * Hold back a REMOTE -> LOCAL write while the user is typing into that file, and queue the path
-   * so the next sync decides again.
-   *
-   * The whole decision is deferred, not just the write. Writing is the last step of a sequence that
-   * also records a new baseline, and skipping only the write would leave the state DB claiming a
-   * body the file does not hold — the failure feature 063 already paid for once. Deferring costs a
-   * few seconds: the debounce window closes shortly after typing stops, and the queued path is
-   * re-evaluated with fresh state.
-   *
-   * Uploads are deliberately NOT deferred. They read the file and leave it alone, so there is
-   * nothing to collide with, and holding them back would make "Sync on file change" stop doing the
-   * one thing it exists for.
-   */
+  // If-Match 412: the remote changed between PROPFIND and PUT, so treat it as a conflict instead of overwriting (docs/spec.md §6.5).
+  private async uploadOrConflict(
+    remote: RemoteFileInfo, base: FileState | undefined, localHash: string,
+    remoteId: string, idType: FileState['idType'], summary: SyncSessionSummary,
+  ): Promise<void> {
+    try {
+      await this.uploadFile(remote.path, localHash, remoteId, idType, remote, summary);
+    } catch (err) {
+      if (!(err instanceof PreconditionFailedError)) throw err;
+      void this.opts.logger?.log(`upload: If-Match 412 (remote changed during sync) → conflict → ${remote.path}`);
+      await this.handleConflict(remote.path, base, remote, remoteId, idType, summary);
+    }
+  }
+
+  // Applies the bundle direction of a listed plugin to one of its code or data files. Returns true when the file was
+  // handled here; false leaves it to the regular decision (docs/spec.md §7).
+  private async applyPluginFileAction(
+    remote: RemoteFileInfo, base: FileState | undefined,
+    side: { localPresent: boolean; localHash: string; localChanged: boolean; remoteId: string; idType: FileState['idType'] },
+    summary: SyncSessionSummary,
+  ): Promise<boolean> {
+    const action = this.plugins.fileAction(remote.path, {
+      localPresent: side.localPresent, remotePresent: true, tracked: base !== undefined,
+      sameContent: fileSameContent({
+        localHash: side.localPresent ? side.localHash : null, remote, base: base ?? null, localChanged: side.localChanged,
+      }),
+    });
+    switch (action) {
+      case 'download':
+        if (!this.deferIfBeingEdited(remote.path, 'download')) await this.downloadFile(remote, side.remoteId, side.idType, summary);
+        return true;
+      case 'upload':
+        await this.uploadOrConflict(remote, base, side.localHash, side.remoteId, side.idType, summary);
+        return true;
+      case 'hold':
+        await this.handleConflict(remote.path, base, remote, side.remoteId, side.idType, summary);
+        return true;
+      case 'skip':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // True when a listed plugin file exists on one side only and the bundle direction says it must stay there.
+  private pluginSkips(path: string, side: 'local-only' | 'remote-only'): boolean {
+    if (!this.plugins.isPluginPath(path)) return false;
+    return this.plugins.fileAction(path, {
+      localPresent: side === 'local-only', remotePresent: side === 'remote-only',
+      tracked: !!this.opts.stateDB.getFile(path), sameContent: false,
+    }) === 'skip';
+  }
+
+  // Defers the whole decision, not just the write: a new baseline is recorded with it, and skipping only the write would
+  // leave StateDB claiming a body the file does not hold. Uploads are never deferred; they leave the file alone (docs/spec.md §5.7b).
   private deferIfBeingEdited(path: string, what: 'download' | 'conflict'): boolean {
     if (!this.opts.isBeingEdited?.(path)) return false;
     void this.opts.logger?.log(`${what}: deferred — "${path}" is being edited right now`);
@@ -1508,13 +1341,6 @@ export class SyncEngine {
     return true;
   }
 
-  /**
-   * A previously-synced file is gone locally → propagate the local deletion to the server, unless
-   * the server copy diverged from what we last synced (then restore it so a remote edit is not lost).
-   * The decision uses the server-side checksum (recalc, no download) for reliability; deletions go
-   * to the Nextcloud trashbin (recoverable).
-   */
-  /** @see DeletionService.applyLocalDeletion */
   private applyLocalDeletion(
     remote: RemoteFileInfo, base: FileState, remoteId: string, idType: FileState['idType'],
     summary: SyncSessionSummary,
@@ -1522,10 +1348,7 @@ export class SyncEngine {
     return this.deletion.applyLocalDeletion(this.client!, remote, base, remoteId, idType, summary);
   }
 
-  // Delegators to the transfer service (feature 074): the client and upload strategy are resolved
-  // here (they are created lazily and can be replaced) and handed in on every call.
 
-  /** @see TransferService.uploadFile */
   private uploadFile(
     path: string, localHash: string, remoteId: string,
     idType: FileState['idType'], remote: RemoteFileInfo,
@@ -1537,9 +1360,7 @@ export class SyncEngine {
   }
 
 
-  // ── US2: Version history ───────────────────────────────────────────────────
 
-  /** @see VersionService.listVersions */
   async listVersions(path: string): Promise<FileVersion[]> {
     const { client, features } = await this.ensureClient();
     return this.versions.listVersions(client, features, path);
@@ -1569,31 +1390,28 @@ export class SyncEngine {
 
   /** @see VersionService.restoreVersion */
   async restoreVersion(path: string, version: FileVersion): Promise<void> {
-    const { client, features } = await this.ensureClient();
-    return this.versions.restoreVersion(client, features, path, version);
+    return this.activityGate.runExclusive(async () => {
+      const { client, features } = await this.ensureClient();
+      await this.versions.restoreVersion(client, features, path, version);
+    });
   }
 
-  /** @see TransferService.acquireLock */
   private acquireLock(path: string): Promise<string | null> {
     return this.transfer.acquireLock(this.client!, path);
   }
 
-  /** @see TransferService.releaseLock */
   private releaseLock(path: string, token: string | null): Promise<void> {
     return this.transfer.releaseLock(this.client!, path, token);
   }
 
-  /** @see TransferService.isRemoteOverSizeLimit */
   private isRemoteOverSizeLimit(remote: RemoteFileInfo): boolean {
     return this.transfer.isRemoteOverSizeLimit(remote);
   }
 
-  /** @see TransferService.warnDownloadSkipped */
   private warnDownloadSkipped(path: string, sizeBytes: number): void {
     this.transfer.warnDownloadSkipped(path, sizeBytes);
   }
 
-  /** @see TransferService.downloadFile */
   private downloadFile(
     remote: RemoteFileInfo, remoteId: string,
     idType: FileState['idType'], summary: SyncSessionSummary,
@@ -1601,10 +1419,7 @@ export class SyncEngine {
     return this.transfer.downloadFile(this.client!, remote, remoteId, idType, summary);
   }
 
-  // Delegators to the conflict applier (feature 074). Existing suites drive both of these through
-  // the engine, which is where the wiring gets proven.
 
-  /** @see ConflictApplier.handleConflict */
   private handleConflict(
     path: string, base: FileState | undefined, remote: RemoteFileInfo,
     remoteId: string, idType: FileState['idType'], summary: SyncSessionSummary,
@@ -1614,35 +1429,36 @@ export class SyncEngine {
     );
   }
 
-  /** @see ConflictApplier.resolveByPreferLocal */
   private resolveByPreferLocal(
     path: string, remote: RemoteFileInfo, summary: SyncSessionSummary,
   ): Promise<void> {
     return this.conflicts.resolveByPreferLocal(this.currentConnection(), path, remote, summary);
   }
 
-  /** @see ConflictApplier.resolveByPreferRemote */
   private resolveByPreferRemote(
     path: string, remote: RemoteFileInfo, remoteData: ArrayBuffer,
     remoteId: string, idType: FileState['idType'], summary: SyncSessionSummary,
   ): Promise<void> {
-    return this.conflicts.resolveByPreferRemote(path, remote, remoteData, remoteId, idType, summary);
+    return this.conflicts.resolveByPreferRemote(
+      path, remote, remoteData, remoteId, idType, summary, this.currentConnection().client,
+    );
   }
 
-  /** @see ConflictApplier.resolveByWrite */
   private resolveByWrite(
     path: string, content: string, clean: boolean, remote: RemoteFileInfo,
-    remoteId: string, idType: FileState['idType'], localMtimeBefore: number, summary: SyncSessionSummary,
+    remoteId: string, idType: FileState['idType'], summary: SyncSessionSummary,
   ): Promise<void> {
     return this.conflicts.resolveByWrite(
-      this.currentConnection(), path, content, clean, remote, remoteId, idType, localMtimeBefore, summary,
+      this.currentConnection(), path, content, clean, remote, remoteId, idType, summary,
     );
   }
 
 
-  /** @see DeletionService.processRemoteDeletion */
-  private processRemoteDeletion(path: string, summary: SyncSessionSummary): Promise<void> {
-    return this.deletion.processRemoteDeletion(path, summary);
+  private async processRemoteDeletion(path: string, summary: SyncSessionSummary): Promise<void> {
+    const outcome = await this.deletion.processRemoteDeletion(path, summary);
+    // The entry kept for the retry describes a file the server no longer has. A short-circuit would rebuild the
+    // listing from State, report it as still on the server, and never retry (docs/spec.md §8a.5).
+    if (outcome.status === 'failed') this.opts.stateDB.setRemoteRootEtag(null);
   }
 
   private async processLocalModifications(
@@ -1650,25 +1466,19 @@ export class SyncEngine {
   ): Promise<void> {
     const remotePathSet = new Set(remoteFiles.map(f => f.path));
 
-    // Scan local files in scope for sync (both new and modified).
     const localStats = new Map<string, { size: number; mtime: number }>();
     await this.collectLocalStats('', localStats);
-    // The config folder is not scanned recursively, so explicitly inject the enabled
-    // config-sync category files (bookmarks, themes/snippets, appearance, etc.).
+    // The config folder is not scanned recursively, so inject the enabled config-sync category files.
     for (const p of await this.configSync.enumerateIncludedPaths()) {
       const st = await this.opts.localAdapter.stat(p);
       if (st) localStats.set(p, { size: st.size, mtime: st.mtime });
     }
 
-    // Pre-filter with the cheap, synchronous checks (already handled remotely; signature fast-path),
-    // then upload the survivors with bounded concurrency (P1-A). The content-unchanged hash check
-    // stays inside the worker (it requires reading the file).
+    // Cheap synchronous pre-filter, then bounded-parallel upload; the content-hash check stays in the worker because it needs a read.
     const uploadCandidates = [...localStats.entries()].filter(([path, st]) => {
-      if (remotePathSet.has(path)) return false; // already handled in the remote-changes loop
+      if (remotePathSet.has(path) || this.pluginSkips(path, 'local-only')) return false;
       const base = this.opts.stateDB.getFile(path);
-      // Fast-path (P0-A): skip known files whose post-write stat signature is unchanged — no read,
-      // no hash. Replaces the old `st.mtime <= base.mtime` filter, which was always false on mobile
-      // (setMtime no-op) and forced a full-vault rehash every sync.
+      // Skip files whose post-write stat signature is unchanged (no read, no hash); an mtime filter is always false on mobile.
       return !(base && this.isLocallyUnchanged(base, st));
     });
     await this.runFileBatch(
@@ -1679,7 +1489,7 @@ export class SyncEngine {
         const base = this.opts.stateDB.getFile(path);
         const data = await this.opts.localAdapter.readBinary(path);
         const localHash = await sha256(data);
-        if (base && localHash === base.localHash) return; // content unchanged
+        if (base && localHash === base.localHash) return;
         // For new files, use the local hash as remoteId (= the server checksum after upload).
         const remoteId = base?.remoteId ?? localHash;
         const idType: FileState['idType'] = base?.idType ?? 'sha256';
@@ -1687,7 +1497,7 @@ export class SyncEngine {
         try {
           await this.uploadFile(
             path, localHash, remoteId, idType,
-            { path, fileId: base?.remoteFileId ?? null, checksum: null, etag: null, size: st.size, lastModified: st.mtime },
+            { path, fileId: base?.remoteFileId ?? null, checksum: null, etag: null, size: st.size, lastModified: st.mtime, creationTime: 0 },
             summary,
           );
         } catch (err) {
@@ -1701,9 +1511,8 @@ export class SyncEngine {
       true,
     );
 
-    // Detect local renames and deletions: files in StateDB that are no longer in localStats.
     const rt = this.getOrCreateRenameTracker();
-    // Build a map of new (unsynced) local files for hash-based rename detection.
+    // New (unsynced) local files, for hash-based rename detection.
     const newLocalFiles = new Map<string, { hash: string; size: number }>();
     for (const [path, st] of localStats) {
       if (!this.opts.stateDB.getFile(path)) {
@@ -1728,80 +1537,56 @@ export class SyncEngine {
       }
     }
 
-    // Remaining missing paths (not renames) are genuine local deletions → delete from remote.
-    //
-    // Feature 086 (issue #46): this used to fire a bare DELETE, reasoning that a path missing from
-    // the listing could not be on the server either, so a 404 was the expected — harmless — answer.
-    // That holds only while the listing is complete, and this issue showed it is not always: a file
-    // the server still had could be destroyed on the strength of a listing that had simply lost it.
-    // deleteLocallyMissing asks about the path directly and hands anything still present to the same
-    // proof path every other deletion goes through. Watch mode shares this method, so a delete
-    // decides identically whether it comes from a scan or from a single vault event.
+    // Remaining missing paths are genuine local deletions. deleteLocallyMissing asks about the path directly and routes anything
+    // still present through the usual proof path: a listing that lost a file must not get it destroyed on the server (issue #46).
+    // Watch mode shares it, so a scan and a single vault event decide identically.
     for (const path of missingPaths) {
-      if (localRenames.has(path)) continue; // handled as rename above
+      if (localRenames.has(path)) continue;
       const fileState = this.opts.stateDB.getFile(path);
       if (!fileState) continue;
       void this.opts.logger?.log(`delete-remote: locally deleted, propagating to server → ${path}`);
       try {
         await this.deletion.deleteLocallyMissing(this.client!, path, fileState, summary);
       } catch (err) {
-        // G1-2: an unanswerable probe or a genuinely failed DELETE keeps the tracking entry, so the
-        // next sync retries. Dropping it would make that sync see the still-present remote file as
-        // "new" and re-download it, silently reverting the user's local deletion.
+        // An unanswerable probe or failed DELETE keeps the tracking entry so the next sync retries; dropping it would
+        // re-download the file and revert the user's deletion.
         console.warn(`[SyncEngine] Failed to delete ${path} from remote:`, err);
         void this.opts.logger?.log(`delete-remote: probe FAILED, keeping tracking for retry → ${path} — ${(err as Error).message}`);
         this.recordError(summary, path, err);
       }
     }
 
-    // Full-scan only: detect REMOTE deletions by absence. A previously-synced file still present
-    // locally but missing from the COMPLETE remote listing was deleted on the server → remove it
-    // locally (via the user's "Deleted files" setting; recoverable). This path is defended against
-    // bad inputs (a truncated/partial listing) because acting on it would silently destroy data.
-    //
-    // The listing's SIZE is deliberately not part of that defence (feature 083 / issue #50). An older
-    // `remotePathSet.size > 0` guard skipped this whole block for an empty listing, back when it was
-    // the only protection; the breaker and the per-candidate 404 re-check below arrived one release
-    // later and subsume it entirely. What it kept doing was refusing to delete anything in the one
-    // case where the server is unambiguous — a vault whose every tracked file really was removed
-    // elsewhere. That left the files on disk AND in State, so the next sync's root-ETag short-circuit
-    // rebuilt them from State as "still on the server" and the vault never converged.
-    //
-    // An empty listing is safe to act on because it cannot be a failure in disguise: a non-207 throws,
-    // and a 404 on the vault folder itself throws RemoteRootMissingError (handled far above, by
-    // re-seeding — not by deleting). What remains is the server saying the folder is there and empty.
+    // Full scan only: a tracked file present locally but missing from the COMPLETE listing was deleted on the server; remove it
+    // locally (recoverable via "Deleted files"). An empty listing is deliberately acted on (issue #50): it is no failure in
+    // disguise (a non-207 or a root 404 throws), and refusing left files in State that the root-ETag short-circuit rebuilt as
+    // "still on the server", so the vault never converged. The breaker and per-candidate 404 re-check below guard partial listings (docs/spec.md §8).
     if (isFullScan) {
-      // 1) Build candidates, comparing real content (NOT mtime) so a local edit that did not bump
-      //    mtime is never silently lost — same content-vs-base check the upload loop uses.
+      // Compare real content, not mtime, so a local edit that did not bump mtime is never lost.
       const candidates: string[] = [];
       for (const fileState of this.opts.stateDB.getAllFiles()) {
         const path = fileState.path;
         if (this.isSystemExcluded(path) || remotePathSet.has(path)) continue;
-        if (!localStats.has(path)) continue; // absent locally too — handled by the missing-paths loop
+        if (!localStats.has(path)) continue;
         const data = await this.opts.localAdapter.readBinary(path);
-        if (await sha256(data) !== fileState.localHash) continue; // modified locally → preserve & re-upload
+        if (await sha256(data) !== fileState.localHash) continue;
         candidates.push(path);
       }
 
-      // 2) Circuit breaker: a healthy full listing rarely loses a large fraction of the vault at once.
-      //    If too many files look "remotely deleted", assume a partial/failed listing and refuse.
+      // Circuit breaker: too many apparent remote deletions means a partial or failed listing, so refuse.
       const tracked = this.opts.stateDB.getAllFiles().length;
       const limit = this.effectiveMassDeleteLimit(tracked);
       if (candidates.length > limit) {
         void this.opts.logger?.log(`delete-local: SKIPPED ${candidates.length} absence-deletions — exceeds safety limit (${limit}); likely a partial remote listing`);
         new Notice(`⚠️ ${candidates.length} files look deleted on the server — skipped to avoid mass deletion. Re-sync to retry.`, 10000);
-        // Tripping the breaker is an UNRESOLVED state: record it as an error so (a) the UI surfaces it
-        // and (b) the root-ETag short-circuit convergence gate (spec 023 §8a.5) invalidates the stored
-        // etag — otherwise the next sync would short-circuit on stale State and the "re-sync to retry"
-        // advice would never re-evaluate the deletions (the breaker would be stuck silently).
+        // An unresolved state: record it as an error so the UI surfaces it and the root-ETag short-circuit is invalidated;
+        // otherwise "re-sync to retry" would never re-evaluate the deletions (docs/spec.md §8a.5).
         this.recordError(summary, '(mass-delete breaker)', new Error(`Skipped ${candidates.length} absence-deletions — exceeds safety limit ${limit}`), {
           all: candidates,
         });
         return;
       }
 
-      // 3) Re-verify each candidate is really gone (targeted PROPFIND 404), so a file merely missing
-      //    from the bulk listing is never deleted locally on a false negative.
+      // Re-verify each candidate with a targeted PROPFIND so a false negative in the bulk listing never deletes locally.
       for (const path of candidates) {
         let goneOnServer = false;
         try { goneOnServer = !(await this.client!.remoteExists(path)); } catch { goneOnServer = false; }
@@ -1815,27 +1600,8 @@ export class SyncEngine {
     }
   }
 
-  /**
-   * Directory reconciliation (DP). Directories are FIRST-CLASS, contentless entities, symmetric
-   * with files — a directory is NEVER deleted merely because it holds no file (an empty directory
-   * is a legitimate thing a user may keep). Instead, existence differences are propagated like file
-   * creates/deletes, tracked in the StateDB so absence means a real deletion, not "never existed":
-   *
-   *   - local-only & untracked   → the user created it here   → MKCOL on the remote (incl. EMPTY dirs)
-   *   - remote-only & untracked  → created on another device   → mkdir locally
-   *   - tracked, now local-absent → the user deleted it here   → DELETE the remote collection
-   *   - tracked, now remote-absent→ deleted on another device  → trash it locally
-   *   - present both sides        → record/keep tracking
-   *   - absent both sides         → drop stale tracking
-   *
-   * Runs only on a COMPLETE listing (full scan); absence from a partial token diff is not a deletion.
-   * Safety mirrors file deletion: a `massDeleteLimit` circuit breaker guards a suspiciously large
-   * destructive batch (partial/failed listing); a recursive collection DELETE is preceded by an
-   * `isRemoteDirEmpty` probe (children are deleted first by ordering + the earlier file phase) and
-   * optionally wrapped in a lock when the user enabled `fileLockingEnabled`; every failure is left
-   * for the next sync (self-healing).
-   */
-  /** @see DirectoryReconciler.reconcileDirectories */
+  // Runs only on a COMPLETE listing. Directories are first-class entities, never deleted merely for being empty
+  // (docs/spec.md §8a.1, docs/plan.md §16).
   private reconcileDirectories(summary: SyncSessionSummary, cachedDirs?: RemoteDirInfo[]): Promise<void> {
     return this.directories.reconcileDirectories(this.client!, summary, cachedDirs);
   }
@@ -1852,19 +1618,18 @@ export class SyncEngine {
 
     for (const [path, lf] of localFiles) {
       const remote = remoteMap.get(path);
-      if (!remote) { uploads.push(path); continue; }              // new local file — no hash needed
-      if (remote.size !== lf.size) { conflicts.push(path); continue; } // size differs — conflict, no hash
-      // Sizes match: hash is needed ONLY to prove "unchanged", and only when the server provided a
-      // checksum to compare against. Without a server checksum, or for large files exceeding the
-      // size-gate, fall back to conflict resolution without reading the file.
+      if (!remote) { if (!this.pluginSkips(path, 'local-only')) uploads.push(path); continue; }
+      if (remote.size !== lf.size) { conflicts.push(path); continue; }
+      // Hash only to prove "unchanged", and only when the server supplied a checksum; otherwise (or above the size gate)
+      // fall back to conflict resolution without reading the file.
       if (!remote.checksum || lf.size > MAX_HASH_SIZE) { conflicts.push(path); continue; }
       const localHash = await sha256(await this.opts.localAdapter.readBinary(path));
       if (localHash === remote.checksum) unchanged.push(path);
       else conflicts.push(path);
     }
     for (const remote of remoteFiles) {
-      if (this.isSystemExcluded(remote.path)) continue; // do not import excluded paths (.obsidian, etc.)
-      if (!localFiles.has(remote.path)) downloads.push(remote.path);
+      if (this.isSystemExcluded(remote.path)) continue;
+      if (!localFiles.has(remote.path) && !this.pluginSkips(remote.path, 'remote-only')) downloads.push(remote.path);
     }
     return { uploads, downloads, conflicts, unchanged, deletes: [] };
   }
@@ -1873,15 +1638,12 @@ export class SyncEngine {
     plan: InitialSyncPlan, remoteFiles: RemoteFileInfo[], summary: SyncSessionSummary,
     localFiles: Map<string, { size: number; mtime: number }>,
   ): Promise<void> {
-    // P0-C: the caller (initialSync) already scanned the vault; reuse the stat map instead of
-    // re-scanning here. Hashing is deferred to upload time (or was already done in buildInitialPlan
-    // for unchanged files, which use remote.checksum as the authoritative hash).
+    // The caller already scanned the vault, so reuse the stat map; hashing is deferred to upload time.
     const remoteMap = new Map(remoteFiles.map(f => [f.path, f]));
     const actionFiles = plan.uploads.length + plan.downloads.length + plan.conflicts.length;
     this.syncProgress = { processed: 0, total: actionFiles };
     if (actionFiles > 0) this.opts.statusBar.setProgress(0, actionFiles);
 
-    // Bounded-parallel uploads (P1-A); same-directory uploads serialized to avoid 423s.
     await this.runFileBatch(
       plan.uploads,
       (path) => path,
@@ -1891,32 +1653,56 @@ export class SyncEngine {
           const lf = localFiles.get(path);
           if (!lf) return;
           const data = await this.opts.localAdapter.readBinary(path);
-          // Task 3: no pre-hash in the scan; compute the hash now from the bytes we just read so the
-          // recorded state has a real content hash (also reused for the OC-Checksum upload header).
+          // Hash from the bytes just read; reused for the OC-Checksum upload header so the client does not hash twice.
           const localHash = await sha256(data);
-          // P1-C: reuse the hash we just computed from THIS exact buffer for the OC-Checksum header
-          // (safe — same bytes), so the client doesn't hash the file a second time.
-          const outcome = await this.uploadStrategy!.upload(this.client!, path, data, lf.mtime, { precomputedSha256: localHash });
+          // The local creation time is read before the upload; a server value for the same path is honoured (docs/spec.md §9.7).
+          const before = await this.opts.localAdapter.stat(path);
+          const ctime = uploadCreationTimeMs(before?.ctime, remoteMap.get(path)?.creationTime ?? 0);
+          const outcome = await this.uploadStrategy!.upload(this.client!, path, data, lf.mtime, { precomputedSha256: localHash, ctime });
           if (outcome === 'skipped') { this.tickProgress(); return; }
           summary.uploadedCount++;
           this.recordHistory(path, 'uploaded');
           const stat = await this.opts.localAdapter.stat(path);
           this.opts.stateDB.setFile(await this.withLocalSignature({ path, localHash, remoteId: localHash, idType: 'sha256', size: lf.size, mtime: stat?.mtime ?? 0, remoteFileId: null, isConflicted: false }));
-          // Feature 038: the initial-sync upload also converges this file → seed its merge base.
-          // This batch uploads via uploadStrategy directly (not uploadFile), so it needs its own
-          // recordMergeBase; without it a file first pushed by initial sync has no base and a later
-          // concurrent edit duplicates shared blocks (caught by the M-first b1 matrix case).
-          this.recordMergeBase(path, new TextDecoder().decode(data));
+          // This batch bypasses uploadFile, so it seeds its own merge base; without it a later concurrent edit duplicates shared blocks.
+          this.recordMergeBase(path, data);
         } catch (err) { this.recordError(summary, path, err); this.retryQueue.push(path); }
         this.tickProgress();
       },
       true,
     );
 
-    // Bounded-parallel downloads (P1-A). No directory serialization needed (each writes a distinct
-    // local file; remote reads don't contend), so serializeByDir=false.
+    // A plugin's manifest.json is written after every other code file of its bundle (docs/spec.md §7): downloads' rest,
+    // then conflicts' rest, then the manifests.
+    const dl = partitionPluginManifestsLast(plan.downloads, (path) => path, this.opts.configDir);
+    const cf = partitionPluginManifestsLast(plan.conflicts, (path) => path, this.opts.configDir);
+    await this.downloadPlanned(dl.rest, remoteMap, summary);
+
+    // Identical on both sides: seed State with no transfer and no local write (the local mtime is left unchanged).
+    for (const path of plan.unchanged) {
+      const lf = localFiles.get(path);
+      const remote = remoteMap.get(path);
+      if (!lf || !remote) continue;
+      const mtime = remote.lastModified || lf.mtime;
+      // Classified unchanged only after localHash === remote.checksum, so the checksum is the content hash for both sides.
+      this.opts.stateDB.setFile(await this.withLocalSignature({
+        path, localHash: remote.checksum!, remoteId: remote.checksum!, idType: 'sha256',
+        size: lf.size, mtime, remoteFileId: remote.fileId, isConflicted: false,
+      }, remote.lastModified));
+      await this.creationTime.align(this.client!, remote);
+    }
+
+    await this.resolvePlannedConflicts(cf.rest, remoteMap, summary);
+    await this.downloadPlanned(dl.manifests, remoteMap, summary);
+    await this.resolvePlannedConflicts(cf.manifests, remoteMap, summary);
+  }
+
+  private async downloadPlanned(
+    paths: string[], remoteMap: Map<string, RemoteFileInfo>, summary: SyncSessionSummary,
+  ): Promise<void> {
+    // No directory serialization: each worker writes a distinct local file.
     await this.runFileBatch(
-      plan.downloads,
+      paths,
       (path) => path,
       (path) => remoteMap.get(path)?.size ?? 0,
       async (path) => {
@@ -1929,27 +1715,12 @@ export class SyncEngine {
       },
       false,
     );
+  }
 
-    // Files already identical on both sides: seed the state DB (no transfer needed).
-    // Apply remote mtime to local so both sides are in sync.
-    for (const path of plan.unchanged) {
-      const lf = localFiles.get(path);
-      const remote = remoteMap.get(path);
-      if (!lf || !remote) continue;
-      const mtime = remote.lastModified || lf.mtime;
-      if (remote.lastModified) {
-        await this.opts.localAdapter.setMtime(path, remote.lastModified);
-      }
-      // buildInitialPlan classified this file as unchanged only after confirming localHash === remote.checksum,
-      // so remote.checksum is the authoritative content hash for both sides.
-      this.opts.stateDB.setFile(await this.withLocalSignature({
-        path, localHash: remote.checksum!, remoteId: remote.checksum!, idType: 'sha256',
-        size: lf.size, mtime, remoteFileId: remote.fileId, isConflicted: false,
-      }, remote.lastModified));
-    }
-
-    // Files present on both sides with differing content: resolve as conflicts.
-    for (const path of plan.conflicts) {
+  private async resolvePlannedConflicts(
+    paths: string[], remoteMap: Map<string, RemoteFileInfo>, summary: SyncSessionSummary,
+  ): Promise<void> {
+    for (const path of paths) {
       try {
         const remote = remoteMap.get(path)!;
         const { remoteId, idType } = remoteIdOf(remote);
@@ -1959,7 +1730,6 @@ export class SyncEngine {
     }
   }
 
-  /** Increment progress counter and push to the status bar. */
   private tickProgress(): void {
     this.syncProgress.processed = Math.min(this.syncProgress.processed + 1, this.syncProgress.total);
     if (this.syncProgress.total > 0) {
@@ -1967,43 +1737,32 @@ export class SyncEngine {
     }
   }
 
-  // Delegators to the scan modules (feature 074). They bind nothing and decide nothing; they exist
-  // because the enumeration is reached from several places in this class and, more importantly,
-  // because the existing suites drive it through the engine — which is exactly what proves the
-  // engine is still wired to the modules rather than merely compiling against them.
 
-  /** @see LocalScanner.scanLocalFiles */
   private scanLocalFiles(): Promise<Map<string, { size: number; mtime: number }>> {
     return this.localScanner.scanLocalFiles();
   }
 
-  /** @see LocalScanner.collectLocalStats — `_dir` has been unused since the Vault-cache switch. */
   private collectLocalStats(_dir: string, out: Map<string, { size: number; mtime: number }>): Promise<void> {
     return this.localScanner.collectLocalStats(out);
   }
 
-  /** @see RemoteListingSource.obtainFullScanListing */
   private obtainFullScanListing(
     client: IWebDAVClient,
   ): Promise<{ remoteFiles: RemoteFileInfo[]; cachedDirs: RemoteDirInfo[] | null }> {
     return this.remoteListing.obtainFullScanListing(client);
   }
 
-  /** @see RemoteListingSource.rebuildRemoteFilesFromState */
   private rebuildRemoteFilesFromState(): RemoteFileInfo[] {
     return this.remoteListing.rebuildRemoteFilesFromState();
   }
 
-  /** @see RemoteListingSource.rebuildRemoteDirsFromState */
   private rebuildRemoteDirsFromState(): RemoteDirInfo[] {
     return this.remoteListing.rebuildRemoteDirsFromState();
   }
 
-  /**
-   * Binds this engine's settings and config resolver for {@link isSystemExcludedPure}. The rules —
-   * and the remote-deletion scope guard they enforce — live in `./policy`, where they can be tested
-   * against a plain context object instead of a whole engine.
-   */
+  // Rules and the remote-deletion scope guard live in ./policy so they can be tested without an engine. Community
+  // plugin files are decided by the ConfigSyncResolver.isIncluded gate: only the files of a plugin listed for this
+  // session pass, every other path under plugins/ is excluded.
   private isSystemExcluded(path: string): boolean {
     return isSystemExcludedPure(path, {
       excludedFolders: this.opts.settings?.excludedFolders ?? [],
@@ -2013,4 +1772,3 @@ export class SyncEngine {
     });
   }
 }
-

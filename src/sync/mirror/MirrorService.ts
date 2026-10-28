@@ -1,23 +1,17 @@
-// Mirror from remote, lifted out of SyncEngine (feature 074, Phase 7).
-//
-// A one-way reset: make the vault look like the server, then leave the state DB in a shape where the
-// next ordinary sync sees no difference at all. It is not a sync — nothing is merged and nothing is
-// uploaded — which is exactly why it is separable from the reconcile loop.
-//
-// Planning and applying are deliberately two calls. The plan is shown to the user before anything is
-// touched, and a plan that could not be built reliably comes back with `ok: false` and an empty
-// action list: a failed remote listing must produce ZERO deletions, never a plan that reads "the
-// server has nothing, so delete everything".
+// One-way reset: make the vault look like the server, then leave the state DB so the next ordinary sync
+// sees no difference. Planning and applying are separate calls; a plan that could not be built reliably
+// returns `ok: false` with no actions, so a failed remote listing yields ZERO deletions.
 import { TFolder, Vault, App, normalizePath } from 'obsidian';
-import { FileState, RemoteDirInfo, RemoteFileInfo } from '../../types';
+import { FileState, RemoteFileInfo, RemoteDirInfo, SyncSessionSummary } from '../../types';
 import { buildMirrorPlan, MirrorPlan, MirrorResult, LocalFileEntry } from '../mirrorPlan';
-import { planStateConvergence } from './convergence';
+import { planStateConvergence, planDirConvergence, leftoverFileState } from './convergence';
 import { LocalAdapter } from '../../data/LocalAdapter';
 import { StateDB } from '../../data/StateDB';
 import { IStatusBar } from '../../ui/StatusBarItem';
 import { IWebDAVClient } from '../../network/IWebDAVClient';
 import { SyncJournal } from '../session/SyncJournal';
 import { MergeBaseRecorder } from '../session/MergeBaseRecorder';
+import type { PluginSessionPort } from '../plugins/PluginSyncCoordinator';
 import { TransferService } from '../transfer/TransferService';
 import { DeletionService } from '../deletion/DeletionService';
 import { LocalScanner } from '../scan/LocalScanner';
@@ -25,15 +19,11 @@ import { RemoteListingSource } from '../scan/RemoteListingSource';
 import { withLocalSignature } from '../../data/localSignature';
 import { FileLogger } from '../../util/FileLogger';
 import { sha256 } from '../../util/hash';
+import { partitionPluginManifestsLast } from '../plugins/pluginPaths';
 
-/**
- * The engine's progress surface. A port rather than a field because the counters are shared with an
- * ordinary sync — the status bar must not show two different notions of "how far along" depending on
- * which one is running.
- */
+// A port because the counters are shared with an ordinary sync; the status bar must show one notion of progress.
 export interface MirrorProgress {
   begin(total: number): void;
-  /** Advance by one and return how many are done. */
   tick(): number;
 }
 
@@ -41,40 +31,42 @@ export interface MirrorDeps {
   app: App;
   localAdapter: Pick<LocalAdapter, 'stat' | 'readBinary'>;
   stateDB: Pick<StateDB,
-    'getFile' | 'setFile' | 'getAllFiles' | 'deleteFile'
-    | 'getAllDirs' | 'setDir' | 'deleteDir'
-    | 'setRemoteRootEtag' | 'setSyncToken' | 'save'>;
+    'getFile' | 'setFile' | 'getAllFiles' | 'deleteFile' | 'deleteDir'
+    | 'getAllDirs' | 'getDir' | 'setDir' | 'setRemoteRootEtag' | 'setSyncToken'>;
   statusBar: IStatusBar;
   journal: SyncJournal;
   mergeBase: MergeBaseRecorder;
+  plugins: PluginSessionPort;
   transfer: TransferService;
   deletion: DeletionService;
   localScanner: Pick<LocalScanner, 'collectLocalStats'>;
   remoteListing: Pick<RemoteListingSource, 'resolveRemoteChecksums'>;
   progress: MirrorProgress;
-  /** Config-folder paths the enabled config-sync categories include. */
   enumerateIncludedConfigPaths(): Promise<string[]>;
   isSystemExcluded(path: string): boolean;
-  /** Connect (or reuse the connection). Mirror can run before any sync has, so this may connect. */
+  // Writes the state DB, the merge bases and the history to disk; rejects when a write fails.
+  persist(): Promise<void>;
+  // Mirror can run before any sync has, so this may need to connect.
   connect(): Promise<IWebDAVClient>;
   logger?: Pick<FileLogger, 'log'>;
 }
+
+// Path reported in MirrorResult.errors when the final state save fails (it belongs to no file).
+export const STATE_SAVE_ERROR_PATH = '(state save)';
 
 export class MirrorService {
   constructor(private readonly deps: MirrorDeps) {}
 
   async planRemoteMirror(onPhase?: (label: string) => void): Promise<MirrorPlan> {
-    // Lazily build (and cache) the WebDAV client + features, exactly like a normal sync does — the
-    // client is only created on first sync, so a mirror invoked before any sync must connect here.
     onPhase?.('Connecting to the server…');
     let client: IWebDAVClient;
     try {
       client = await this.deps.connect();
     } catch (err) {
-      return buildMirrorPlan([], [], [], [], () => false, false, `Not connected to the server: ${(err as Error).message}`);
+      return buildMirrorPlan([], [], [], () => false, false, `Not connected to the server: ${(err as Error).message}`);
     }
 
-    // 1. Authoritative remote listing (no short-circuit). Failure ⇒ abort gate (zero deletions).
+    // Authoritative remote listing (no short-circuit); a failure aborts with zero deletions.
     onPhase?.('Reading the remote file list…');
     let remoteFiles: RemoteFileInfo[];
     let remoteDirs: RemoteDirInfo[];
@@ -82,10 +74,22 @@ export class MirrorService {
       remoteFiles = await client.getFiles('');
       remoteDirs = await client.getDirectories('');
     } catch (err) {
-      return buildMirrorPlan([], [], [], [], () => false, false, `Failed to list the remote: ${(err as Error).message}`);
+      return buildMirrorPlan([], [], [], () => false, false, `Failed to list the remote: ${(err as Error).message}`);
     }
 
-    // 2. Local files.
+    this.deps.plugins.begin();
+    try {
+      await this.deps.plugins.prepare(client, remoteFiles);
+      return await this.planFromListing(client, remoteFiles, remoteDirs, onPhase);
+    } finally {
+      this.deps.plugins.discard();
+    }
+  }
+
+  // Builds the plan once the plugin session has selected the listed plugins (they decide isSystemExcluded).
+  private async planFromListing(
+    client: IWebDAVClient, remoteFiles: RemoteFileInfo[], remoteDirs: RemoteDirInfo[], onPhase?: (label: string) => void,
+  ): Promise<MirrorPlan> {
     onPhase?.('Comparing with local files…');
     const localStats = new Map<string, { size: number; mtime: number }>();
     await this.deps.localScanner.collectLocalStats(localStats);
@@ -94,20 +98,17 @@ export class MirrorService {
       if (st) localStats.set(p, { size: st.size, mtime: st.mtime });
     }
 
-    // 2a. Populate missing server-side checksums for files present on BOTH sides — server-computed,
-    //     no download (Nextcloud ChecksumUpdatePlugin), same as a normal sync. Without this, files put
-    //     on the server by another tool (the common migration case) carry no checksum, so every one
-    //     would be re-downloaded even when byte-identical. Best-effort: unsupported servers leave the
-    //     checksum null and those files fall back to download (still correct, just not skipped).
+    // Server-computed checksums for files on both sides (no download). Without them, files put on the server
+    // by another tool carry none and are re-downloaded even when identical. Best-effort: unsupported servers
+    // leave null and those files fall back to download.
     onPhase?.('Checking server checksums…');
     await this.deps.remoteListing.resolveRemoteChecksums(client, remoteFiles, localStats);
 
     onPhase?.('Checking local files…');
-    // Only hash a local file when its remote counterpart now carries a checksum we can compare against
-    // (otherwise it would be downloaded regardless, so hashing would be wasted I/O).
+    // Hash only when the remote counterpart has a checksum to compare against; otherwise it is downloaded anyway.
     const remoteChecksum = new Map(remoteFiles.map((r) => [r.path, r.checksum] as const));
     const localFiles: LocalFileEntry[] = [];
-    for (const [path] of localStats) {
+    for (const [path, st] of localStats) {
       let hash = '';
       const cs = remoteChecksum.get(path);
       if (cs != null && !this.deps.isSystemExcluded(path)) {
@@ -117,61 +118,168 @@ export class MirrorService {
           hash = '';
         }
       }
-      localFiles.push({ path, hash });
+      localFiles.push({ path, hash, size: st.size, mtime: st.mtime });
     }
 
-    // 3. Local folders (empty ones included) for local-only folder deletion.
-    const vault = this.deps.app.vault as Vault & { getAllFolders?: (includeRoot?: boolean) => TFolder[] };
-    const localDirs = (vault.getAllFolders?.() ?? []).map((f) => f.path).filter((p) => p && p !== '/');
+    // Empty folders included, for local-only folder deletion.
+    const localDirs = this.readLocalDirs();
 
-    return buildMirrorPlan(remoteFiles, remoteDirs, localFiles, localDirs, (p) => this.deps.isSystemExcluded(p), true);
+    return buildMirrorPlan(remoteFiles, localFiles, localDirs, (p) => this.deps.isSystemExcluded(p), true, null, remoteDirs);
   }
 
-  /**
-   * Apply a Pull-mirror plan produced by {@link planRemoteMirror}: download everything the remote has
-   * (or that differs), delete local-only files/folders (via the user's Obsidian "Deleted files"
-   * setting — recoverable), then reconcile StateDB to the remote so the next normal sync converges to
-   * zero diff (FR-011 / SC-002). The caller must pass an `ok:true` plan and have aborted in-flight sync.
-   */
+  // The caller must pass an `ok:true` plan and have aborted any in-flight sync. Local-only files go through
+  // the user's "Deleted files" setting, so they are recoverable.
   async applyRemoteMirror(
     client: IWebDAVClient, plan: MirrorPlan, onProgress?: (done: number, total: number) => void,
   ): Promise<MirrorResult> {
-    const result: MirrorResult = { downloaded: 0, deleted: 0, skipped: plan.skipCount, errors: [] };
+    const result: MirrorResult = { downloaded: 0, deleted: 0, skipped: plan.skipCount, createdDirs: 0, errors: [], pluginsNeedingRestart: [] };
     if (!plan.ok) return result;
 
     const summary = this.deps.journal.newSummary();
 
-    // Progress reporting: identical surface to a normal "Sync now" — the status bar on desktop and the
-    // single result toast on mobile (NoticeStatusBar), driven via setStatus/setProgress/tickProgress
-    // and closed with setSyncComplete. Total = every action item (downloads + file/folder deletions).
-    const total = plan.createDirs.length + plan.downloads.length + plan.deleteFiles.length + plan.deleteDirs.length;
+    // Total = every action item (downloads + file/folder deletions).
+    const total = plan.downloads.length + plan.deleteFiles.length + plan.deleteDirs.length;
     this.deps.progress.begin(total);
     this.deps.statusBar.setStatus('syncing');
     if (total > 0) this.deps.statusBar.setProgress(0, total);
     onProgress?.(0, total);
-    // Advance the status-bar progress AND the dialog progress (feature 049) together. Two statements
-    // on purpose: folding the tick into the optional call would make it conditional on a callback
-    // being supplied, because `onProgress?.(...)` does not evaluate its arguments when onProgress is
-    // undefined — and the status bar would then never move for a caller that passes none.
+    // Two statements on purpose: `onProgress?.(this.deps.progress.tick(), ...)` would skip the tick when no
+    // callback is supplied, and the status bar would never move.
     const tick = (): void => {
       const done = this.deps.progress.tick();
       onProgress?.(done, total);
     };
 
-    // 1. Create remote-only folders locally, parents before children. This is what makes empty
-    //    remote collections survive a mirror: they have no file path that could imply their existence.
-    for (const remoteDir of plan.createDirs) {
-      try {
-        await this.deps.app.vault.adapter.mkdir(normalizePath(remoteDir.path));
-        this.deps.stateDB.setDir({ path: remoteDir.path, remoteFileId: remoteDir.fileId });
-      } catch (err) {
-        result.errors.push({ path: remoteDir.path, message: (err as Error).message });
+    this.deps.plugins.begin();
+    try {
+      await this.deps.plugins.prepare(client, plan.remoteFiles);
+      await this.runDownloads(client, plan, summary, result, tick);
+
+      // Failures are judged after every deletion ran: a path can still disappear with its parent folder.
+      const failedDeletes: Array<{ path: string; message: string; isDir: boolean }> = [];
+      const removeLocal = async (path: string, isDir: boolean): Promise<void> => {
+        try {
+          const outcome = await this.deps.deletion.processRemoteDeletion(path, summary);
+          if (outcome.status === 'deleted') result.deleted++;
+          else if (outcome.status === 'failed') failedDeletes.push({ path, message: outcome.message, isDir });
+        } catch (err) {
+          failedDeletes.push({ path, message: (err as Error).message, isDir });
+        }
+        tick();
+      };
+      for (const path of plan.deleteFiles.filter((p) => !this.deps.isSystemExcluded(p))) await removeLocal(path, false);
+      // Local-only folders, child to parent. Dir tracking is dropped inside processRemoteDeletion with the subtree's.
+      for (const path of plan.deleteDirs) await removeLocal(path, true);
+
+      const leftoverFiles = new Set<string>();
+      const leftoverDirs = new Set<string>();
+      for (const f of failedDeletes) {
+        if (await this.deps.app.vault.adapter.exists(normalizePath(f.path))) {
+          result.errors.push({ path: f.path, message: f.message });
+          (f.isDir ? leftoverDirs : leftoverFiles).add(f.path);
+        } else {
+          result.deleted++;
+        }
       }
-      tick();
+
+      // Remote folders missing locally; progress is not ticked because creation is not part of the total.
+      for (const path of plan.createDirs) {
+        try {
+          await this.deps.app.vault.adapter.mkdir(normalizePath(path));
+          result.createdDirs++;
+        } catch (err) {
+          result.errors.push({ path, message: (err as Error).message });
+        }
+      }
+
+      const { toTrack, toDrop } = planStateConvergence(
+        plan.remoteFiles,
+        new Set(plan.downloads.map((d) => d.path)),
+        this.deps.stateDB.getAllFiles().map((f) => f.path),
+        (p) => this.deps.isSystemExcluded(p),
+        leftoverFiles,
+      );
+      const plannedByPath = new Map(plan.skipped.map((s) => [s.path, s] as const));
+      // Skipped files (content already matched) never ran downloadFile; track them as unchanged
+      // (localHash === remoteId), else the next sync reads them as a conflict.
+      for (const remote of toTrack) {
+        const remoteId = remote.checksum ?? remote.etag ?? String(remote.size);
+        const idType: FileState['idType'] = remote.checksum ? 'sha256' : (remote.etag ? 'etag' : 'size');
+        // A file that changed after the plan was built must not be marked converged: the next sync decides.
+        const planned = plannedByPath.get(remote.path);
+        const nowStat = await this.deps.localAdapter.stat(remote.path);
+        if (!planned || !nowStat || nowStat.size !== planned.size || nowStat.mtime !== planned.mtime) {
+          void this.deps.logger?.log(`mirror: ${remote.path} changed locally since the plan — left for the next sync`);
+          continue;
+        }
+        const existing = this.deps.stateDB.getFile(remote.path);
+        const localHash = remote.checksum ?? existing?.localHash ?? remoteId;
+        this.deps.stateDB.setFile(await withLocalSignature(this.deps.localAdapter, {
+          path: remote.path, localHash, remoteId, idType,
+          size: remote.size, mtime: remote.lastModified || (existing?.mtime ?? 0),
+          remoteFileId: remote.fileId, isConflicted: false,
+        }, remote.lastModified));
+      }
+      // Also clears entries whose local file was already absent but still tracked.
+      for (const path of toDrop) {
+        this.deps.stateDB.deleteFile(path);
+        this.deps.mergeBase.drop(path);
+      }
+      // A leftover stays tracked at its current content, so the next sync retries the deletion instead of uploading it.
+      for (const path of leftoverFiles) {
+        const st = await this.deps.localAdapter.stat(path);
+        if (!st) continue;
+        let localHash = '';
+        try {
+          localHash = await sha256(await this.deps.localAdapter.readBinary(path));
+        } catch {
+          localHash = '';
+        }
+        const remoteFileId = this.deps.stateDB.getFile(path)?.remoteFileId ?? null;
+        this.deps.stateDB.setFile(await withLocalSignature(
+          this.deps.localAdapter, leftoverFileState(path, localHash, st, remoteFileId),
+        ));
+      }
+      const localDirsNow = new Set(this.readLocalDirs());
+      const dirs = planDirConvergence(
+        plan.remoteDirs,
+        localDirsNow,
+        this.deps.stateDB.getAllDirs().map((d) => d.path),
+        (p) => this.deps.isSystemExcluded(p),
+        leftoverDirs,
+      );
+      for (const d of dirs.toTrack) this.deps.stateDB.setDir({ path: d.path, remoteFileId: d.remoteFileId });
+      for (const path of dirs.toDrop) this.deps.stateDB.deleteDir(path);
+      // A leftover folder stays tracked: untracked it would be created on the server by the next sync.
+      for (const path of leftoverDirs) {
+        this.deps.stateDB.setDir({ path, remoteFileId: this.deps.stateDB.getDir(path)?.remoteFileId ?? null });
+      }
+      // Force a real full scan next sync so convergence is verified without a short-circuit.
+      this.deps.stateDB.setRemoteRootEtag(null);
+      this.deps.stateDB.setSyncToken('');
+    } finally {
+      this.finishPlugins(result);
+      await this.persistSafely(result);
     }
 
-    // 2. Downloads (remote wins — forced overwrite, not a 3-way merge).
-    for (const remote of plan.downloads) {
+    // Deletions are counted in summary.downloadedCount (processRemoteDeletion increments it), as in a normal sync.
+    summary.errorCount = result.errors.length;
+    this.deps.statusBar.setSyncComplete(0, summary.downloadedCount, 0, result.errors.length);
+
+    void this.deps.logger?.log(
+      `mirror: applied — downloaded=${result.downloaded}, deleted=${result.deleted}, skipped=${result.skipped}, createdDirs=${result.createdDirs}, errors=${result.errors.length}`,
+    );
+    return result;
+  }
+
+  // Remote wins: forced overwrite, not a 3-way merge. Excluded paths (unlisted plugins, data.json of a plugin
+  // awaiting restart) are skipped, and plugin manifests go last so a plugin is only loadable once its files are in.
+  private async runDownloads(
+    client: IWebDAVClient, plan: MirrorPlan, summary: SyncSessionSummary, result: MirrorResult, tick: () => void,
+  ): Promise<void> {
+    const eligible = plan.downloads.filter((d) => !this.deps.isSystemExcluded(d.path));
+    const { rest, manifests } = partitionPluginManifestsLast(eligible, (d) => d.path, this.deps.app.vault.configDir);
+    for (const remote of [...rest, ...manifests]) {
       const remoteId = remote.checksum ?? remote.etag ?? String(remote.size);
       const idType: FileState['idType'] = remote.checksum ? 'sha256' : (remote.etag ? 'etag' : 'size');
       try {
@@ -183,88 +291,30 @@ export class MirrorService {
       }
       tick();
     }
+  }
 
-    // 3. Delete local-only files (processRemoteDeletion honors the trash setting + cleans StateDB).
-    for (const path of plan.deleteFiles) {
-      try {
-        await this.deps.deletion.processRemoteDeletion(path, summary);
-        result.deleted++;
-      } catch (err) {
-        result.errors.push({ path, message: (err as Error).message });
-      }
-      tick();
+  // Never throws: a failed plugin session end must not stop the state save.
+  private finishPlugins(result: MirrorResult): void {
+    try {
+      result.pluginsNeedingRestart = this.deps.plugins.finish().pluginsNeedingRestart;
+    } catch (err) {
+      void this.deps.logger?.log(`mirror: plugin session finish failed — ${(err as Error).message}`, 'error');
     }
+  }
 
-    // 4. Delete local-only folders child→parent (trashFile handles TFolder). Dir tracking is dropped
-    //    inside processRemoteDeletion, together with the whole subtree's (feature 086).
-    for (const path of plan.deleteDirs) {
-      try {
-        await this.deps.deletion.processRemoteDeletion(path, summary);
-        result.deleted++;
-      } catch (err) {
-        result.errors.push({ path, message: (err as Error).message });
-      }
-      tick();
+  // Empty folders included; the vault root is not a folder to track.
+  private readLocalDirs(): string[] {
+    const vault = this.deps.app.vault as Vault & { getAllFolders?: (includeRoot?: boolean) => TFolder[] };
+    return (vault.getAllFolders?.() ?? []).map((f) => f.path).filter((p) => p && p !== '/');
+  }
+
+  // Never throws: a failed save is reported as one more error so the result is not shown as a success.
+  private async persistSafely(result: MirrorResult): Promise<void> {
+    try {
+      await this.deps.persist();
+    } catch (err) {
+      result.errors.push({ path: STATE_SAVE_ERROR_PATH, message: `Could not save the sync state: ${(err as Error).message}` });
+      void this.deps.logger?.log(`mirror: state save FAILED — ${(err as Error).message}`, 'error');
     }
-
-    // 5. Reconcile StateDB to the remote so the next sync sees no diff (self-healing, FR-011).
-    const { toTrack, toDrop } = planStateConvergence(
-      plan.remoteFiles,
-      new Set(plan.downloads.map((d) => d.path)),
-      this.deps.stateDB.getAllFiles().map((f) => f.path),
-      (p) => this.deps.isSystemExcluded(p),
-    );
-    // 5a. Skipped files (content already matched): downloadFile did NOT run for them, so ensure they
-    //     are tracked as unchanged (localHash === remoteId) — otherwise an untracked-but-present file
-    //     would be misread as a conflict next sync and break convergence.
-    for (const remote of toTrack) {
-      const remoteId = remote.checksum ?? remote.etag ?? String(remote.size);
-      const idType: FileState['idType'] = remote.checksum ? 'sha256' : (remote.etag ? 'etag' : 'size');
-      const existing = this.deps.stateDB.getFile(remote.path);
-      const localHash = remote.checksum ?? existing?.localHash ?? remoteId;
-      this.deps.stateDB.setFile(await withLocalSignature(this.deps.localAdapter, {
-        path: remote.path, localHash, remoteId, idType,
-        size: remote.size, mtime: remote.lastModified || (existing?.mtime ?? 0),
-        remoteFileId: remote.fileId, isConflicted: false,
-      }, remote.lastModified));
-    }
-    // 5b. Drop any tracked file the remote no longer has (deleteFiles already dropped their entries;
-    //     this also clears entries whose local file was absent locally but still tracked).
-    for (const path of toDrop) {
-      this.deps.stateDB.deleteFile(path);
-      this.deps.mergeBase.drop(path);
-    }
-    // 5c. Mirror directory tracking to the authoritative remote directory listing, including empty
-    //     collections. A later ordinary sync must not reinterpret mirror-created/deleted folders as
-    //     fresh local changes.
-    const remoteDirPaths = new Set(plan.remoteDirs.map((d) => d.path));
-    for (const remoteDir of plan.remoteDirs) {
-      this.deps.stateDB.setDir({ path: remoteDir.path, remoteFileId: remoteDir.fileId });
-    }
-    for (const trackedDir of this.deps.stateDB.getAllDirs()) {
-      if (!remoteDirPaths.has(trackedDir.path) && !this.deps.isSystemExcluded(trackedDir.path)) {
-        this.deps.stateDB.deleteDir(trackedDir.path);
-      }
-    }
-
-    // 5d. Force a real full scan next sync (never short-circuit) so convergence is genuinely verified.
-    this.deps.stateDB.setRemoteRootEtag(null);
-    this.deps.stateDB.setSyncToken('');
-
-    // Persist the mirror result before reporting success. Mirror runs outside the ordinary full-sync
-    // save path; without this, an immediate app reload can resurrect stale tracking.
-    await this.deps.stateDB.save();
-
-    // Close the progress surface with a result — exactly like a normal sync. On mobile this replaces
-    // the "🔄 Syncing…" toast with the outcome (and auto-dismisses); on desktop it updates the bar.
-    // Deletions are reflected in summary.downloadedCount (processRemoteDeletion increments it), matching
-    // how a normal sync reports remote-deletions-applied-locally.
-    summary.errorCount = result.errors.length;
-    this.deps.statusBar.setSyncComplete(0, summary.downloadedCount, 0, result.errors.length);
-
-    void this.deps.logger?.log(
-      `mirror: applied — downloaded=${result.downloaded}, deleted=${result.deleted}, skipped=${result.skipped}, errors=${result.errors.length}`,
-    );
-    return result;
   }
 }

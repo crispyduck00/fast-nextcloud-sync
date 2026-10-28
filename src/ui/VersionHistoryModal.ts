@@ -3,8 +3,11 @@ import { FileVersion } from '../types';
 import { confirmModal } from './ConfirmModal';
 import { displayVersionTimeline, previousVersionInTimeline } from '../sync/versions/versionTimeline';
 
+// Instance field, not a DOM attribute: restoring version A then B while A is pending would run two onRestore calls
+// on the same file concurrently (last-write-wins).
 export class BusyGate {
   private busy = false;
+
   tryEnter(): boolean {
     if (this.busy) return false;
     this.busy = true;
