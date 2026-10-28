@@ -35,7 +35,7 @@ export default defineConfig([
       // Deferred (spec 062, "明示的に対象外（Deferred）"): adopting the declarative
       // settings API (getSettingDefinitions()) would force dual-defining every setting
       // as declarative metadata, conflicting with this project's single-source-of-truth
-      // design principle (CLAUDE.md), while the settings surface is actively shrinking
+      // design principle, while the settings surface is actively shrinking
       // (specs 028/032/033), not growing. Off rather than left at "warn" so it doesn't
       // become permanent lint noise; the reviewer dashboard still surfaces it independently.
       "obsidianmd/settings-tab/prefer-setting-definitions": "off",

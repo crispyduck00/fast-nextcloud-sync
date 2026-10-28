@@ -338,3 +338,11 @@ Before editing code:
 7. promote only validated integration states to the standalone repository
 
 When in doubt, preserve isolation first. It is easier to merge clean topics later than to separate mixed history afterward.
+
+## 1.0.13 adaptation / 0.2.0-beta.1 candidate
+
+The stable main/release 0.1.1 is retained. Candidate development is on `release/0.2.0-beta.1`; the new source is upstream 1.0.13 plus the independently maintained topics in the development integration.
+
+To promote a validated clean development checkout, run `node scripts/promote-integration.mjs /path/to/development-checkout`, then `pnpm verify:source`, build, lint, test and secretlint. The script copies runtime, test and toolchain files while preserving standalone identity/version/release history/workflows. It records the exact integration commit and hashes every runtime source file plus styles.css. Functional fixes still belong to development topic branches first.
+
+Live acceptance is recorded separately from automated evidence in `docs/UPSTREAM-1.0.13-VALIDATION.md`. BRAT currently tries release discovery including prereleases, so an ordinary public prerelease is not an isolated test channel. Supply unaccepted builds as a manual ZIP; do not push a version tag or create a GitHub Release until rollout is intentional. Previously published releases/tags must remain available.

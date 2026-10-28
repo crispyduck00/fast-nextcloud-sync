@@ -1,6 +1,7 @@
 import { RequestUrlParam, RequestUrlResponse } from 'obsidian';
 import { requestUrlWithTimeout } from '../requestWithTimeout';
 import { NO_CACHE_HEADERS } from '../noCacheHeaders';
+import { parseServerUrl } from '../serverUrl';
 
 const INITIAL_RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -131,6 +132,13 @@ export class NextcloudPushClient {
    */
   async ensureConnected(immediate = false): Promise<void> {
     if (this.stopped) return;
+    // A public link token is not an account credential. Never send it to OCS or a Push endpoint,
+    // including a manual endpoint override and foreground/reconnect attempts.
+    if (parseServerUrl(this.opts.serverUrl).isPublicShare) {
+      this.reason = 'Client Push requires a Nextcloud account; public link shares use normal sync';
+      this.setState('unavailable');
+      return;
+    }
     if (!this.networkOnline) {
       this.clearReconnectTimer();
       this.reason = 'Network reported offline';

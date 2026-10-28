@@ -10,6 +10,14 @@ This fork grew from a personal goal: make synchronization feel faster and requir
 
 > Contributors and future development sessions: see [DEVELOPMENT.md](DEVELOPMENT.md) for the branch, integration, promotion, and release workflow.
 
+## Upstream 1.0.13 test candidate
+
+Stable release **0.1.1 remains unchanged**. The new **0.2.0-beta.1** candidate lives on a separate branch and is supplied as a manually installable ZIP while real-device/server acceptance is pending. It is not published as a GitHub Release yet because BRAT can automatically select prereleases.
+
+The candidate preserves the upstream engine and independently maintained fork topics. Selected plugins stay in upstream full bundle sessions; known plugin Push IDs are deferred without advancing the root checkpoint. Unknown/generic/structural hints retain conservative fallback. Creation-time alignment can emit metadata Pushes; Restore now refreshes the persisted merge base.
+
+See [validation, limitations and live acceptance](docs/UPSTREAM-1.0.13-VALIDATION.md). Source provenance is recorded in `DEVELOPMENT-SOURCE.json`; `pnpm verify:source` checks runtime parity with the promoted integration.
+
 ## Demo
 
 ### Fast Desktop ↔ Android synchronization
@@ -301,3 +309,21 @@ See [LICENSE](LICENSE).
 ---
 
 **Fast Nextcloud Sync is an unofficial fork and is not an official release of the upstream Nextcloud Sync project.**
+
+## Settings defaults
+
+| Setting | Desktop | Android |
+|---|---|---|
+| Startup delay | 1 second | 1 second |
+| Network timeout | 30 seconds | 30 seconds |
+| Periodic sync | 15 minutes | Off (foreground/resume sync) |
+| Watch | On | Explicit opt-in; off on first run |
+| Wi-Fi only | Off | On on first run |
+| Maximum file size | Unlimited | 20 MB on first run |
+| Config folder sync | Off | Off |
+| Selected community plugins | Empty, per device | Empty, per device |
+| Client Push | Off until enabled | Off until enabled |
+
+Initial network concurrency follows reported memory: 16 at 8 GB or more, 8 at 4 GB or more, 4 below that, and 3 when memory is not reported. Existing saved choices are retained. iOS Watch remains gated off in this fork.
+
+If the Server URL includes a subfolder, that subfolder must already exist in Nextcloud. The plugin creates its vault folder inside it and does not create the configured parent subfolder. For `HTTP 409 (MKCOL)`, create that parent or correct the URL, then retry. Verify the resolved remote path before the first test-vault sync.

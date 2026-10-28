@@ -28,11 +28,23 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Verify development source
+        run: pnpm verify:source
+
+      - name: Test
+        run: pnpm test --runInBand
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Secretlint
+        run: pnpm secretlint
 
       - name: Build plugin
         run: pnpm run build
@@ -70,31 +82,11 @@ jobs:
           # Tags containing a hyphen (e.g. 0.2.0-beta.1) are published as pre-releases
           # so BRAT beta testers can opt in without affecting the stable community listing.
           PRERELEASE=""
-          case "${GITHUB_REF_NAME}" in *-*) PRERELEASE="--prerelease" ;; esac
+          case "${GITHUB_REF_NAME}" in *-*) PRERELEASE="--prerelease --latest=false" ;; esac
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
             $PRERELEASE \
             ${{ steps.assets.outputs.files }}
 
-      - name: Clean up beta pre-releases superseded by this stable release
-        # Runs only for stable releases. Skips for pre-release tags containing a hyphen
-        # (e.g. 0.2.0-beta.1) so a beta never deletes itself.
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME}"
-          echo "Cleaning up pre-releases superseded by ${VERSION}..."
-          # Delete every same-version pre-release (those starting with "X.Y.Z-", e.g.
-          # X.Y.Z-beta.* / -rc.*), removing both the GitHub Release and its git tag. The stable
-          # Release is already published, so a single delete failure only warns and never fails
-          # the job (idempotent and non-fatal).
-          gh release list --limit 200 --json tagName --jq '.[].tagName' | while read -r TAG; do
-            case "$TAG" in
-              "${VERSION}-"*)
-                echo "Deleting superseded pre-release: ${TAG}"
-                gh release delete "${TAG}" --cleanup-tag --yes || echo "::warning::Failed to delete ${TAG}"
-                ;;
-            esac
-          done
+      # Published releases and tags are retained for reproducible testing and rollback.

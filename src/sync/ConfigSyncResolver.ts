@@ -1,16 +1,10 @@
 import { ConfigSyncCategories, DavSyncSettings } from '../types';
 import { LocalAdapter } from '../data/LocalAdapter';
+import type { PluginPathGate } from './plugins/PluginSyncCoordinator';
+import { PLUGIN_BUNDLE_FILES, parsePluginRel } from './plugins/pluginPaths';
 
-/**
- * Fixed allowlist of known Obsidian core-plugin config filenames (relative to the config dir)
- * claimed by the "Core plugin settings" category. A fixed allowlist (not a denylist of
- * "everything uncategorized") is used deliberately so device-specific files like
- * `workspace.json` and unknown/community-origin files are never swept in.
- *
- * `bookmarks.json` is intentionally absent — it is owned by the dedicated Bookmarks category
- * (single ownership). This is a data list: it can be extended in one place as Obsidian ships
- * new core plugins, with no logic change.
- */
+// An allowlist, not a denylist, so device-specific files (`workspace.json`) and community-origin files
+// are never swept in. `bookmarks.json` is absent on purpose: the Bookmarks category owns it.
 export const CORE_PLUGIN_CONFIG_FILES: readonly string[] = [
   'core-plugins.json',
   'core-plugins-migration.json',
@@ -42,21 +36,15 @@ export const CORE_PLUGIN_CONFIG_FILES: readonly string[] = [
   'workspaces.json',
 ];
 
-/** One config-sync category: a UI-facing label/description plus a pure path matcher. */
 export interface ConfigSyncCategoryDescriptor {
   key: keyof ConfigSyncCategories;
   label: string;
   description: string;
-  /** True when `rel` (a path relative to the config dir) belongs to this category. */
   matches(rel: string): boolean;
 }
 
-/**
- * The two config-sync categories (feature 029: Bookmarks + Other settings). This single list drives
- * BOTH the include decision (iterate enabled categories) and the settings UI (one toggle per
- * descriptor), so the UI and the sync logic cannot drift apart. "Other settings" folds together the
- * former appearance / themes-snippets / hotkeys / core-plugins categories.
- */
+// One list drives both the include decision and the settings UI toggles, so they cannot drift apart
+// (docs/spec.md §7).
 export const CONFIG_SYNC_CATEGORIES: readonly ConfigSyncCategoryDescriptor[] = [
   {
     key: 'bookmarks',
@@ -77,30 +65,23 @@ export const CONFIG_SYNC_CATEGORIES: readonly ConfigSyncCategoryDescriptor[] = [
 ];
 
 export interface ConfigSyncResolverOptions {
-  /** Vault#configDir, e.g. `.obsidian` (user-relocatable). All paths resolve against this. */
+  // Vault#configDir, e.g. `.obsidian` (user-relocatable).
   configDir: string;
-  /** Live settings reference (read on every call, so toggles take effect without a rebuild). */
+  // Read on every call, so toggles take effect without a rebuild.
   settings: Pick<DavSyncSettings, 'syncConfigFolder' | 'configSync'>;
-  /**
-   * This plugin's own directory (`<configDir>/plugins/<id>`), holding the sync-state DB and
-   * data.json. A hard exclusion — never synced. (Already covered by the `plugins/` rule, but
-   * kept explicit as defense-in-depth per FR-004.)
-   */
+  // This plugin's own directory (sync-state DB, data.json): never synced. Already covered by the
+  // `plugins/` rule, kept explicit as defense in depth.
   pluginDir: string;
-  /** Used only by `enumerateIncludedPaths` to list/stat included files. */
   localAdapter: Pick<LocalAdapter, 'list' | 'stat'>;
+  // Decides which community-plugin files sync.
+  pluginGate: PluginPathGate;
 }
 
-/**
- * Single source of truth for "does this config-folder path sync, and which config paths should
- * be injected into the local scan". `SyncEngine.isSystemExcluded`, the remote-file filter, and
- * the remote-deletion scope guard all consult `isIncluded`, so exclusion (and the FR-008 safety
- * guarantee) is defined in exactly one place.
- */
+// Single source of truth for which config-folder paths sync: `SyncEngine.isSystemExcluded`, the
+// remote-file filter and the remote-deletion scope guard all consult `isIncluded`.
 export class ConfigSyncResolver {
   constructor(private readonly opts: ConfigSyncResolverOptions) {}
 
-  /** Path relative to configDir, or null if `path` is not under (or equal to) the config dir. */
   private rel(path: string): string | null {
     const cd = this.opts.configDir;
     if (path === cd) return '';
@@ -109,7 +90,6 @@ export class ConfigSyncResolver {
     return path.slice(prefix.length);
   }
 
-  /** True if `path` is the config dir itself or anything under it. */
   isUnderConfigDir(path: string): boolean {
     return this.rel(path) !== null;
   }
@@ -119,37 +99,30 @@ export class ConfigSyncResolver {
     return path === pd || path.startsWith(`${pd}/`);
   }
 
-  /**
-   * Whether a config-folder path is included in the sync given current settings. Pure (no I/O).
-   * Hard exclusions (plugins/, the plugin dir) are evaluated before category matching, so no
-   * toggle combination can ever include community-plugin code or the sync-state DB.
-   */
+  // Hard exclusions are evaluated before category matching, so no toggle combination can include
+  // this plugin's own folder; other plugins pass only through the gate (docs/spec.md §7).
   isIncluded(path: string): boolean {
     const rel = this.rel(path);
-    if (rel === null) return false;                 // not under configDir
-    if (rel === '') return false;                   // the dir itself is not a file
-    if (!this.opts.settings.syncConfigFolder) return false; // C1: master off
-    // C2/C3: hard exclusions win over every category toggle.
+    if (rel === null) return false;
+    if (rel === '') return false;
+    if (!this.opts.settings.syncConfigFolder) return false;
     if (this.isUnderPluginDir(path)) return false;
-    if (rel === 'plugins' || rel.startsWith('plugins/')) return false;
-    // C4: any enabled category that claims this path.
+    if (rel === 'plugins' || rel.startsWith('plugins/')) {
+      const ref = parsePluginRel(rel);
+      return ref !== null && this.opts.pluginGate.isPluginFileIncluded(ref.id, ref.file);
+    }
     const cs = this.opts.settings.configSync;
     for (const cat of CONFIG_SYNC_CATEGORIES) {
       if (cs[cat.key] && cat.matches(rel)) return true;
     }
-    return false; // C5
+    return false;
   }
 
-  /** True iff `path` is an included config-folder file (used to route conflicts to newest-wins). */
   isConfigFolderConflictPath(path: string): boolean {
     return this.isUnderConfigDir(path) && this.isIncluded(path);
   }
 
-  /**
-   * Concrete config-folder paths to inject into the local scan. Enumerates only what is in
-   * scope — fixed files that exist + a recursive listing of themes/ and snippets/. Never lists
-   * `plugins/`. Every returned path P satisfies `isIncluded(P) === true`.
-   */
+  // Never lists `plugins/` (gated plugin files are stat'ed directly); every returned path satisfies `isIncluded`.
   async enumerateIncludedPaths(): Promise<string[]> {
     if (!this.opts.settings.syncConfigFolder) return [];
     const cd = this.opts.configDir;
@@ -170,7 +143,17 @@ export class ConfigSyncResolver {
       await this.listRecursive(`${cd}/snippets`, out);
     }
 
-    return Array.from(new Set(out));
+    await this.addGatedPluginFiles(out);
+    return Array.from(new Set(out)).filter((p) => this.isIncluded(p));
+  }
+
+  private async addGatedPluginFiles(out: string[]): Promise<void> {
+    for (const id of this.opts.pluginGate.includedPluginIds()) {
+      for (const file of PLUGIN_BUNDLE_FILES) {
+        const p = `${this.opts.configDir}/plugins/${id}/${file}`;
+        if (await this.opts.localAdapter.stat(p)) out.push(p);
+      }
+    }
   }
 
   private async listRecursive(dir: string, out: string[]): Promise<void> {
@@ -179,7 +162,7 @@ export class ConfigSyncResolver {
       for (const f of listing.files) out.push(f);
       for (const sub of listing.folders) await this.listRecursive(sub, out);
     } catch {
-      /* directory absent or unreadable — nothing to inject */
+      // Absent or unreadable directory: nothing to inject.
     }
   }
 }

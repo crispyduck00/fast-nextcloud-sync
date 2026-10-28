@@ -379,6 +379,14 @@ export class PushSyncScheduler {
         return;
       }
 
+      if (result === 'plugin-pending') {
+        this.observedPushRootEtag = null;
+        // A full session prepares and orders plugin bundles. Deferring one must not certify the
+        // whole root as processed, hide an unrelated unknown ID, or create a retry timer loop.
+        this.opts.log?.('push: known plugin work waits for the next full session; root checkpoint not advanced');
+        return;
+      }
+
       this.opts.onReconciliationTriggered?.();
       this.lastTriggeredSyncAt = Date.now();
       if (result === 'done') {
@@ -387,6 +395,7 @@ export class PushSyncScheduler {
         // ETag and remains conservative.
         this.observedPushRootEtag = rootEtag;
       } else {
+        this.observedPushRootEtag = null;
         // The path was deliberately deferred/unresolved (error, conflict, retry queue). It still
         // counts as attempted work for status, but must never certify this root state as processed.
         this.opts.log?.('push: targeted batch left deferred/unresolved work → push root checkpoint not advanced');

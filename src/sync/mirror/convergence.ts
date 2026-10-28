@@ -1,43 +1,67 @@
-// State convergence after a mirror (feature 075).
-//
-// A mirror only moves the files that differ, so when it finishes the state DB does not yet describe
-// what the vault now holds. Two gaps are left, and both are silent until the NEXT sync reads them
-// wrong:
-//
-//   A file the mirror skipped — content already identical — was never recorded, so an untracked but
-//   present file reads as a conflict and the reset appears to undo itself.
-//
-//   A file the state DB still tracks but the remote no longer has would be re-created locally.
-//
-// Deciding which files fall into each gap is set arithmetic over lists the caller already holds, so
-// it needs no I/O. Only the writing does.
-import { RemoteFileInfo } from '../../types';
+// A mirror moves only differing files, so afterwards the state DB must gain the skipped-but-identical
+// files (else they read as conflicts) and lose files the remote no longer has (else they are re-created).
+// Pure set arithmetic; the caller does the writing.
+import { DirState, FileState, RemoteDirInfo, RemoteFileInfo } from '../../types';
 
 export interface StateConvergence {
-  /** Present remotely, not downloaded ⇒ never recorded by the transfer. Track them. */
+  // Present remotely but not downloaded, so never recorded by the transfer.
   toTrack: RemoteFileInfo[];
-  /** Tracked but no longer on the remote. Drop them, along with their merge base. */
+  // Tracked but gone from the remote; dropped together with their merge base.
   toDrop: string[];
 }
 
-/**
- * Work out which files the state DB must gain and which it must lose for the next ordinary sync to
- * see no difference at all.
- *
- * Excluded paths are left alone on BOTH sides. They are outside the plugin's scope, so a mirror has
- * no business either recording them or forgetting them — the config folder is tracked by its own
- * mechanism, and dropping its entries here would make the next sync re-download it.
- */
+// Excluded paths are left alone on both sides: the config folder is tracked by its own mechanism, and
+// dropping its entries here would make the next sync re-download it.
 export function planStateConvergence(
   remoteFiles: readonly RemoteFileInfo[],
   downloadedPaths: ReadonlySet<string>,
   trackedPaths: readonly string[],
   isExcluded: (path: string) => boolean,
+  // Paths that must stay tracked although the remote lacks them: local leftovers whose deletion failed.
+  keepTracked: ReadonlySet<string> = new Set(),
 ): StateConvergence {
   const eligibleRemote = remoteFiles.filter((r) => !isExcluded(r.path));
   const remoteSet = new Set(eligibleRemote.map((r) => r.path));
   return {
     toTrack: eligibleRemote.filter((r) => !downloadedPaths.has(r.path)),
-    toDrop: trackedPaths.filter((p) => !isExcluded(p) && !remoteSet.has(p)),
+    toDrop: trackedPaths.filter((p) => !isExcluded(p) && !remoteSet.has(p) && !keepTracked.has(p)),
+  };
+}
+
+export interface DirConvergence {
+  // Remote folders that exist locally now.
+  toTrack: DirState[];
+  // Tracked folders that are not in toTrack: gone from the remote, or still missing locally.
+  toDrop: string[];
+}
+
+// A tracked folder that is missing locally reads as "deleted on this device" and is removed from the server
+// by the next sync (docs/spec.md §8a.1), so tracking follows what the vault reports, never the plan.
+export function planDirConvergence(
+  remoteDirs: readonly RemoteDirInfo[],
+  localDirsNow: ReadonlySet<string>,
+  trackedDirs: readonly string[],
+  isExcluded: (path: string) => boolean,
+  keepTracked: ReadonlySet<string> = new Set(),
+): DirConvergence {
+  const toTrack = remoteDirs
+    .filter((d) => !isExcluded(d.path) && localDirsNow.has(d.path))
+    .map((d) => ({ path: d.path, remoteFileId: d.fileId }));
+  const keep = new Set(toTrack.map((d) => d.path));
+  return {
+    toTrack,
+    toDrop: trackedDirs.filter((p) => !isExcluded(p) && !keep.has(p) && !keepTracked.has(p)),
+  };
+}
+
+// The baseline for a local file the mirror could not delete: "in sync at this content with a remote that no
+// longer has it". The next full scan then reads it as a remote deletion and retries, and never uploads it
+// (docs/spec.md §14).
+export function leftoverFileState(
+  path: string, localHash: string, localStat: { size: number; mtime: number }, remoteFileId: string | null,
+): FileState {
+  return {
+    path, localHash, remoteId: localHash, idType: 'sha256',
+    size: localStat.size, mtime: localStat.mtime, remoteFileId, isConflicted: false,
   };
 }

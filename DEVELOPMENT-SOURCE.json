@@ -1,0 +1,16 @@
+{
+  "upstream": {
+    "repository": "siosig/obsidian-nextcloudsync",
+    "version": "1.0.13",
+    "commit": "a3d206c30c33cb2cb1f81ed71db3a60f08ee01bd"
+  },
+  "development": {
+    "repository": "crispyduck00/obsidian-nextcloudsync",
+    "branch": "integration/all-topics",
+    "commit": "dc086b93bb1304c59d28943f90edc202ccd88696"
+  },
+  "runtime": {
+    "files": 118,
+    "sha256Base64": "9kxOlcxxNKdkk4ejy1bPuD9TuGQt1l8WbKChmHBy8BU="
+  }
+}
